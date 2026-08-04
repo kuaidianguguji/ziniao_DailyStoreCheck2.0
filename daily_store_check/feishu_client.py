@@ -1,0 +1,241 @@
+"""飞书开放平台客户端。
+
+这里集中管理租户 token、控制台多维表、三张数据多维表、三张历史电子表和机器人推送。
+没有填写凭据时客户端进入 dry-run，便于先开发和测试紫鸟/爬虫，不会发出网络请求。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import logging
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any, Iterable
+
+import requests
+
+from .config import StoreTask, is_enabled_switch, normalise_platform
+
+LOGGER = logging.getLogger(__name__)
+
+
+class FeishuClient:
+    """飞书接口的薄封装，业务层不直接拼接 URL 或处理 token。"""
+
+    def __init__(self, config: dict[str, Any]):
+        """读取飞书节点并创建可复用的 HTTP Session。"""
+        self.config = config.get("feishu", {})
+        self.base_url = str(self.config.get("base_url", "https://open.feishu.cn")).rstrip("/")
+        self.timeout = int(config.get("data", {}).get("request_timeout_seconds", 30))
+        self._tenant_token = ""
+        self.session = requests.Session()
+
+    @property
+    def configured(self) -> bool:
+        """判断应用凭据是否齐全；具体表的 token/id 在各接口中单独校验。"""
+        return bool(self.config.get("app_id") and self.config.get("app_secret"))
+
+    def get_bitable_ref(self, kind: str, platform: str = "") -> tuple[str, str]:
+        """返回指定多维表的 ``(app_token, table_id)``，并兼容旧版配置。"""
+        bitable = self.config.get("bitable", {})
+        default_token = str(bitable.get("default_app_token") or bitable.get("app_token") or "")
+        if kind == "control":
+            value = bitable.get("control", {})
+            if isinstance(value, dict):
+                return str(value.get("app_token") or default_token), str(value.get("table_id") or bitable.get("control_table_id") or "")
+            return default_token, str(value or bitable.get("control_table_id") or "")
+        if kind == "data" and platform:
+            value = bitable.get("data_tables", {}).get(platform, {})
+            if isinstance(value, dict):
+                return str(value.get("app_token") or default_token), str(value.get("table_id") or "")
+            return default_token, str(value or "")
+        raise ValueError(f"未知多维表类型: {kind}")
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
+        """统一发送请求并检查飞书 code，避免每个接口重复写错误处理。"""
+        response = self.session.request(method, f"{self.base_url}{path}", timeout=self.timeout, **kwargs)
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("code", 0) != 0:
+            raise RuntimeError(f"飞书接口失败 code={payload.get('code')} msg={payload.get('msg')}")
+        return payload
+
+    def _get_tenant_token(self) -> str:
+        """按需获取 tenant_access_token，并在进程内复用。"""
+        if self._tenant_token:
+            return self._tenant_token
+        payload = self._request(
+            "POST",
+            "/open-apis/auth/v3/tenant_access_token/internal",
+            json={"app_id": self.config.get("app_id"), "app_secret": self.config.get("app_secret")},
+        )
+        self._tenant_token = payload.get("tenant_access_token", "")
+        if not self._tenant_token:
+            raise RuntimeError("飞书没有返回 tenant_access_token")
+        return self._tenant_token
+
+    def _headers(self) -> dict[str, str]:
+        """生成带租户 token 的飞书标准请求头。"""
+        return {"Authorization": f"Bearer {self._get_tenant_token()}", "Content-Type": "application/json; charset=utf-8"}
+
+    @staticmethod
+    def _field_value(value: Any) -> Any:
+        """把飞书字段可能返回的数组、人员对象、文本对象转成普通值。"""
+        if isinstance(value, list):
+            return ", ".join(str(FeishuClient._field_value(item)) for item in value)
+        if isinstance(value, dict):
+            return value.get("name") or value.get("text") or value.get("open_id") or value.get("id") or json.dumps(value, ensure_ascii=False)
+        return value
+
+    def _recipient_value(self, value: Any) -> str:
+        """从人员字段提取接收 ID；仅有显示姓名时不冒充 open_id。"""
+        if isinstance(value, list):
+            values = [self._recipient_value(item) for item in value]
+            return ",".join(item for item in values if item)
+        if isinstance(value, dict):
+            receive_id_type = self.config.get("robot", {}).get("receive_id_type", "open_id")
+            keys_by_type = {
+                "open_id": ("open_id", "id"),
+                "user_id": ("user_id", "id"),
+                "union_id": ("union_id", "id"),
+                "email": ("email",),
+            }
+            for key in keys_by_type.get(receive_id_type, (receive_id_type, "id")):
+                if value.get(key):
+                    return str(value[key])
+            LOGGER.warning("推送人员字段只有姓名、没有可用用户 ID: %s", value.get("name", ""))
+            return ""
+        text = str(value or "").strip()
+        receive_id_type = self.config.get("robot", {}).get("receive_id_type", "open_id")
+        if receive_id_type == "open_id" and text and not text.startswith("ou_"):
+            LOGGER.warning("推送人员字段不是人员对象或 open_id，已忽略文本值: %s", text)
+            return ""
+        return text
+
+    def list_records(self, table_id: str, page_size: int = 500, app_token: str = "") -> list[dict[str, Any]]:
+        """分页读取指定多维表的全部记录。"""
+        if not self.configured or not app_token or not table_id:
+            LOGGER.warning("飞书多维表配置不完整，跳过读取 app_token=%s table=%s", bool(app_token), table_id)
+            return []
+        records: list[dict[str, Any]] = []
+        page_token = ""
+        while True:
+            params: dict[str, Any] = {"page_size": page_size}
+            if page_token:
+                params["page_token"] = page_token
+            payload = self._request("GET", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records", headers=self._headers(), params=params)
+            data = payload.get("data", {})
+            records.extend(data.get("items", []))
+            if not data.get("has_more"):
+                break
+            page_token = data.get("page_token", "")
+            if not page_token:
+                break
+        return records
+
+    def list_control_tasks(self) -> list[StoreTask]:
+        """读取控制台并过滤暂停、空开关和缺失必要字段的记录。"""
+        bitable = self.config.get("bitable", {})
+        fields = bitable.get("control_fields", {})
+        app_token, table_id = self.get_bitable_ref("control")
+        records = self.list_records(table_id, app_token=app_token)
+        tasks: list[StoreTask] = []
+        print(f'---test----records:{records}')
+        for record in records:
+            raw = record.get("fields", {})
+            store_name = str(self._field_value(raw.get(fields.get("store_name", "店铺名称"), "")) or "").strip()
+            recipient = self._recipient_value(raw.get(fields.get("recipient", "数据推送人"), "")).strip()
+            switch = self._field_value(raw.get(fields.get("switch", "推送开关"), ""))
+            platform = normalise_platform(self._field_value(raw.get(fields.get("platform", "平台"), "")))
+            browser_oauth = str(raw.get("browserOauth", raw.get("browser_oauth", "")) or "").strip()
+            browser_id = str(raw.get("browserId", raw.get("browser_id", "")) or "").strip()
+            if not store_name or not is_enabled_switch(switch) or platform not in {"tiktok", "shopee", "mercado"}:
+                continue
+            tasks.append(StoreTask(store_name, recipient, platform, browser_oauth, browser_id, record.get("record_id", "")))
+        return tasks
+
+    def batch_create_records(self, table_id: str, rows: Iterable[dict[str, Any]], app_token: str = "") -> None:
+        """批量写入数据多维表；空 rows 不发送请求。"""
+        row_list = list(rows)
+        if not row_list:
+            return
+        if not table_id or not app_token:
+            LOGGER.warning("数据多维表 app_token/table_id 未配置，跳过写入 rows=%s", len(row_list))
+            return
+        if not self.configured:
+            LOGGER.warning("飞书凭据未配置，跳过写入多维表 table=%s rows=%s", table_id, len(row_list))
+            return
+        for start in range(0, len(row_list), 500):
+            chunk = row_list[start:start + 500]
+            self._request("POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create", headers=self._headers(), json={"records": [{"fields": row} for row in chunk]})
+
+    def remove_old_records(self, table_id: str, collected_field: str, retention_days: int, app_token: str = "") -> int:
+        """删除数据多维表中超过保留期的记录，返回删除条数。"""
+        if not self.configured or not app_token or not table_id:
+            return 0
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        old_ids: list[str] = []
+        for record in self.list_records(table_id, app_token=app_token):
+            value = record.get("fields", {}).get(collected_field)
+            try:
+                if isinstance(value, (int, float)) or str(value).isdigit():
+                    timestamp = datetime.fromtimestamp(float(value) / 1000, tz=timezone.utc)
+                else:
+                    timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                    if timestamp.tzinfo is None:
+                        timestamp = timestamp.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError, OSError):
+                continue
+            if timestamp < cutoff and record.get("record_id"):
+                old_ids.append(record["record_id"])
+        for start in range(0, len(old_ids), 500):
+            self._request("POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_delete", headers=self._headers(), json={"records": old_ids[start:start + 500]})
+        return len(old_ids)
+
+    def append_spreadsheet_rows(self, spreadsheet_token: str, rows: list[list[Any]], range_name: str = "Sheet1!A:Z") -> None:
+        """追加历史电子表数据；range_name 通常写成 ``sheet_id!A:Z``。"""
+        if not rows:
+            return
+        if not self.configured or not spreadsheet_token:
+            LOGGER.warning("飞书电子表未配置，跳过追加 rows=%s", len(rows))
+            return
+        self._request("POST", f"/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values_append", headers=self._headers(), json={"valueRange": {"range": range_name, "values": rows}})
+
+    def send_robot_message(self, recipient: str, title: str, content: str) -> None:
+        """优先使用应用机器人按 open_id 定向推送，否则使用 webhook。"""
+        recipients = [item.strip() for item in recipient.split(",") if item.strip()]
+        if recipients and self.config.get("app_id") and self.config.get("app_secret"):
+            receive_id_type = self.config.get("robot", {}).get("receive_id_type", "open_id")
+            for receive_id in recipients:
+                self._request(
+                    "POST",
+                    "/open-apis/im/v1/messages",
+                    headers=self._headers(),
+                    params={"receive_id_type": receive_id_type},
+                    json={"receive_id": receive_id, "msg_type": "text", "content": json.dumps({"text": f"{title}\n{content}"}, ensure_ascii=False)},
+                )
+            return
+        webhook = self.config.get("robot", {}).get("webhook_url", "")
+        if not webhook:
+            LOGGER.warning("飞书机器人 webhook 未配置，跳过推送 recipient=%s", recipient)
+            return
+        body: dict[str, Any] = {"msg_type": "text", "content": {"text": f"{title}\n{content}"}}
+        secret = self.config.get("robot", {}).get("sign_secret", "")
+        if secret:
+            timestamp = str(int(time.time()))
+            body["timestamp"] = timestamp
+            body["sign"] = self._sign(timestamp, secret)
+        response = requests.post(webhook, json=body, timeout=self.timeout)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("code", 0) != 0:
+            raise RuntimeError(f"飞书机器人推送失败: {result}")
+
+    @staticmethod
+    def _sign(timestamp: str, secret: str) -> str:
+        """生成飞书机器人要求的 base64 HMAC-SHA256 签名。"""
+        import base64
+        digest = hmac.new(f"{timestamp}\n{secret}".encode(), digestmod=hashlib.sha256).digest()
+        return base64.b64encode(digest).decode()

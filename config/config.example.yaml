@@ -1,0 +1,86 @@
+ziniao:
+  # 紫鸟浏览器配置。
+  browser:
+    version: v6
+    client_path: ""
+    webdriver_path: ""
+    socket_port: 16851
+  # 推荐在环境变量中填写，不要提交真实账号和密码。
+  user_info:
+    company: ""
+    username: ""
+    password: ""
+
+# 默认等待到每天 07:00 执行一次；使用 --run-now 可立即执行。
+schedule:
+  enabled: true
+  run_time: "07:00"
+  timezone: "Asia/Shanghai"
+  run_once: true
+
+feishu:
+  base_url: "https://open.feishu.cn"
+  app_id: ""
+  app_secret: ""
+  bitable:
+    # 四张多维表属于同一个应用时填写；各表独立时保持为空。
+    default_app_token: ""
+    control:
+      app_token: ""
+      table_id: ""
+    data_tables:
+      tiktok:
+        app_token: ""
+        table_id: ""
+      shopee:
+        app_token: ""
+        table_id: ""
+      mercado:
+        app_token: ""
+        table_id: ""
+    control_fields:
+      store_name: "店铺名"
+      recipient: "推送人员"
+      switch: "开关"
+      platform: "平台"
+    data_fields:
+      store_name: "店铺名"
+      collected_at: "采集时间"
+      metric: "指标"
+      value: "数值"
+      raw_data: "原始数据"
+  spreadsheets:
+    tiktok:
+      token: ""
+      sheet_id: ""
+      range: ""
+    shopee:
+      token: ""
+      sheet_id: ""
+      range: ""
+    mercado:
+      token: ""
+      sheet_id: ""
+      range: ""
+  robot:
+    receive_id_type: "open_id"
+    webhook_url: ""
+    sign_secret: ""
+
+data:
+  retention_days: 90
+  request_timeout_seconds: 30
+  output_dir: "data"
+
+platforms:
+  tiktok:
+    crawler: "tiktok.TK_ad:TiktokAdCrawler"
+  shopee:
+    crawler: "shopee.SP_ad:ShopeeAdCrawler"
+  mercado:
+    crawler: "mercado.MKD_ad:MercadoAdCrawler"
+  meicado:
+    crawler: "mercado.MKD_ad:MercadoAdCrawler"
+
+task:
+  amazon: []

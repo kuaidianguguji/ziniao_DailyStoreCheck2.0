@@ -1,0 +1,4 @@
+-r requirements.txt
+DrissionPage>=4.1,<5
+tzdata>=2025.1
+
