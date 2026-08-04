@@ -74,13 +74,13 @@ data:
 
 platforms:
   tiktok:
-    crawler: "tiktok.TK_ad:TiktokAdCrawler"
+    crawler: "tiktok.TK_auto:TiktokAuto"
   shopee:
-    crawler: "shopee.SP_ad:ShopeeAdCrawler"
+    crawler: "shopee.SP_auto:ShopeeAuto"
   mercado:
-    crawler: "mercado.MKD_ad:MercadoAdCrawler"
+    crawler: "mercado.MKD_auto:MercadoAuto"
   meicado:
-    crawler: "mercado.MKD_ad:MercadoAdCrawler"
+    crawler: "mercado.MKD_auto:MercadoAuto"
 
 task:
   amazon: []

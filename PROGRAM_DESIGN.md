@@ -16,11 +16,10 @@ ziniao_DailyStoreCheck_codex_two/
 │  ├─ config.py                        # 配置加载、平台名标准化、开关判断、StoreTask
 │  ├─ feishu_client.py                 # 飞书 token、多维表、电子表、机器人
 │  ├─ ziniao_client.py                 # 紫鸟 IPC、店铺开关、WebDriver 会话
-│  ├─ base_ad.py                       # DrissionPage 爬虫基类和统一输出结构
 │  └─ orchestrator.py                  # 串行业务流程和平台爬虫注册
-├─ tiktok/TK_ad.py                     # TikTok 广告爬虫
-├─ shopee/SP_ad.py                     # Shopee 广告爬虫
-├─ mercado/MKD_ad.py                   # 美客多广告爬虫
+├─ tiktok/TK_auto.py                   # TikTok 独立自动化和爬虫
+├─ shopee/SP_auto.py                   # Shopee 独立自动化和爬虫
+├─ mercado/MKD_auto.py                 # 美客多独立自动化和爬虫
 ├─ run_daily_store_check.py            # 生产入口和每日时间调度
 ├─ requirements-daily.txt              # 本项目新增依赖
 └─ ziniao_webdriver_demo.py             # 官方示例，保留作对照
@@ -33,7 +32,7 @@ ziniao_DailyStoreCheck_codex_two/
 3. `_prepare_ziniao` 启动紫鸟客户端、更新内核、读取完整店铺列表。
 4. `_run_store` 用控制表店铺名精确匹配紫鸟 `browserName`，得到 `browserOauth` 或 `browserId`。
 5. `ZiniaoStoreSession` 严格调用官方 `startBrowser` 打开一间店铺，连接 WebDriver，完成 `ipDetectionPage` 检测后打开 `launcherPage`；`with` 结束时一定先 `driver.quit`，再调用紫鸟 `stopBrowser`。
-6. `_load_crawler` 根据配置动态载入 `TK_ad.py`、`SP_ad.py` 或 `MKD_ad.py`。
+6. `_load_crawler` 根据配置动态载入 `TK_auto.py`、`SP_auto.py` 或 `MKD_auto.py`。
 7. 爬虫优先用 DrissionPage 连接紫鸟的 `debuggingPort`，输出统一结构。
 8. `_write_feishu` 写入对应数据多维表，并追加对应历史电子表。
 9. `_safe_notify` 根据“推送人员”的 `open_id` 使用应用机器人定向推送；没有人员 ID 时可退回 webhook。
@@ -87,12 +86,12 @@ ziniao_DailyStoreCheck_codex_two/
 - `browser_oauth`：当前已打开店铺的真实紫鸟标识。
 - `opened`：紫鸟返回的调试端口、下载目录、启动页等会话数据。
 
-### `daily_store_check/base_ad.py` 和三个平台文件
+### 三个平台独立文件
 
-- `BaseAdCrawler.collect`：统一打开入口、采集时间和输出字段。
-- `_open_page`：强制用 DrissionPage 连接现有紫鸟 Chromium，不另开普通浏览器，也不回退到 Selenium。
-- `extract_metrics`：每个平台覆盖的页面指标采集点。
-- 平台爬虫不调用 `page.get()`，只通过调试端口接管紫鸟已经打开的当前页面。
+- `TK_auto.py`、`SP_auto.py`、`MKD_auto.py` 各自维护 DrissionPage 连接、标签页获取、页面操作、数据提取和结果组装。
+- 三个平台故意不共享爬虫基类；即使逻辑重复，也保留在各自文件中，方便后续独立修改。
+- 每个文件使用 `Chromium(紫鸟调试端口)` 接管浏览器，再通过 `browser.latest_tab` 获取当前标签页。
+- 平台文件不调用 `tab.get()`，只接管紫鸟已经打开的当前页面。
 - 三个平台当前选择器是骨架示例。登录真实后台后，应以账号当前 DOM 为准替换选择器和指标。
 
 ### `daily_store_check/orchestrator.py`
