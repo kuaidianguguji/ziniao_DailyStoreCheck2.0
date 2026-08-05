@@ -93,6 +93,10 @@ ziniao_DailyStoreCheck_codex_two/
 - 每个文件使用 `Chromium(紫鸟调试端口)` 接管浏览器，再通过 `browser.latest_tab` 获取当前标签页。
 - 平台文件不调用 `tab.get()`，只接管紫鸟已经打开的当前页面。
 - 三个平台当前选择器是骨架示例。登录真实后台后，应以账号当前 DOM 为准替换选择器和指标。
+- `MKD_auto.py` 已列出 7 天和 30 天共 28 个指标，每项 `xpath` 初始为空；空 XPath、找不到元素或解析失败均写入空值。
+- `MKD_auto.py` 还提供 `COMMON_CLICK_STEPS` 和 `PERIOD_CLICK_STEPS`：前者填写进入数据页面所需的菜单点击，后者填写 7 天/30 天切换按钮；每组步骤按列表顺序执行，空 XPath 自动跳过。
+- 美客多货币指标按数值保留两位小数，指标定义标记 `currency_code=BRL`；数量为整数，转换率为不带小数的百分数字符串。
+- 美客多返回的 `飞书字段` 会被编排器合并到多维表中的同名字段，历史电子表也会追加这些指标值。
 
 ### `daily_store_check/orchestrator.py`
 

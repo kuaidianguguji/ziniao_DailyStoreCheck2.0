@@ -106,8 +106,23 @@ class DailyStoreCheck:
                 fields.get("value", "数值"): row.get("数值", ""),
                 fields.get("raw_data", "原始数据"): row.get("原始数据", ""),
             }
+            # 平台可以提供自己的字段字典。美客多用它写入已建立的 28 个同名字段，
+            # 其他平台没有该字段时仍沿用上面的通用结构。
+            platform_fields = row.get("飞书字段", {})
+            if isinstance(platform_fields, dict):
+                record.update(platform_fields)
             record_rows.append(record)
-            spreadsheet_rows.append([record.get(fields.get("store_name", "店铺名")), record.get(fields.get("collected_at", "采集时间")), task.platform, record.get(fields.get("metric", "指标")), record.get(fields.get("value", "数值")), record.get(fields.get("raw_data", "原始数据"))])
+            spreadsheet_row = [
+                record.get(fields.get("store_name", "店铺名")),
+                record.get(fields.get("collected_at", "采集时间")),
+                task.platform,
+                record.get(fields.get("metric", "指标")),
+                record.get(fields.get("value", "数值")),
+                record.get(fields.get("raw_data", "原始数据")),
+            ]
+            if isinstance(platform_fields, dict):
+                spreadsheet_row.extend(platform_fields.values())
+            spreadsheet_rows.append(spreadsheet_row)
         self.feishu.batch_create_records(table_id, record_rows, app_token=app_token)
         spreadsheet_cfg = feishu_cfg.get("spreadsheets", {}).get(task.platform, "")
         if isinstance(spreadsheet_cfg, dict):
@@ -137,8 +152,16 @@ class DailyStoreCheck:
             return "本次没有采集到数据。"
         lines = []
         for row in rows[:20]:
+            platform_fields = row.get("飞书字段", {})
+            if isinstance(platform_fields, dict):
+                for field_name, value in platform_fields.items():
+                    if value != "":
+                        lines.append(f"{field_name}: {value}")
+                continue
             value = str(row.get("数值", ""))
             lines.append(f"{row.get('指标', '')}: {value}")
+        if not lines:
+            return "本次未抓取到有效指标，空值已写入飞书。"
         if len(rows) > 20:
             lines.append(f"其余 {len(rows) - 20} 条已写入飞书。")
         return "\n".join(lines)
