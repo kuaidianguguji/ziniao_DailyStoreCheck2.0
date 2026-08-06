@@ -3,8 +3,8 @@
 本文件独立维护美客多的 DrissionPage 连接、XPath、数值解析和飞书字段组装。
 程序只接管紫鸟已经打开的当前标签页，不会主动访问网址。
 
-后续抓取页面时，只需要把下面各指标的 xpath 从空字符串改成实际 XPath。
-如果 xpath 为空、元素不存在或数值解析失败，该指标默认写入空值，其他指标继续执行。
+下面各指标 XPath 集中维护在本文件中；当前已填写的 XPath 可以直接调整。
+如果某个 XPath 为空、元素不存在或数值解析失败，该指标默认写入空值，其他指标继续执行。
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ HOME_AD_CLOSE_XPATH = '//button[@class="andes-modal__close-button"]'
 
 # 销售量菜单展开按钮和经营指标按钮。
 SALES_SECTION_BUTTON_XPATH = '//input[@id="myml-menu-section-toggle-my_sales"]/ancestor::li[1]//button[@data-section-id="MY_SALES"]//label'
-METRICS_BUTTON_XPATH = '//input[@id="myml-menu-section-toggle-my_sales"]/ancestor::li[1]//div[@data-item-id="MYML_METRICS"]'
+METRICS_BUTTON_XPATH = '//input[@id="myml-menu-section-toggle-my_sales"]/ancestor::li[1]//div[@data-item-id="MYML_METRICS"]//span'
 
 # 页面和按钮操作参数。重试次数 3 表示首次点击失败后再重试 3 次。
 PAGE_READY_TIMEOUT_SECONDS = 60
@@ -39,31 +39,22 @@ CLICK_RETRY_INTERVAL_SECONDS = 2
 NEXT_ELEMENT_TIMEOUT_SECONDS = 30
 
 
-# 进入美客多数据页面的其他可编辑步骤。
-# “销售量 -> 指标”分支由 collect() 根据指标按钮是否可见自动处理，
-# 因此这里不再重复放置指标 XPath，避免页面状态变化时连续点击错误菜单。
-COMMON_CLICK_STEPS: list[dict[str, Any]] = [
-    {"name": "进入经营分析菜单", "xpath": "", "wait_seconds": 1},
-    {"name": "进入数据概览页面", "xpath": "", "wait_seconds": 2},
-]
-
-
-
 # 统计页面中的时间范围切换步骤。
-# 采集 7 天指标前执行 PERIOD_CLICK_STEPS["7天"]；
-# 采集完 7 天指标后执行 PERIOD_CLICK_STEPS["30天"]，再读取 30 天指标。
-# 如果页面默认就是 7 天，可以把 7 天按钮 xpath 留空；30 天按钮必须填写实际 XPath。
+# 日期控件的动态 id 中包含 r_1c，使用 contains() 避免每次页面生成的后缀变化。
+# 每个时间范围都必须先打开日期菜单，再点击对应的快捷选项。
 PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
     "7天": [
-        {"name": "切换到7天数据", "xpath": "", "wait_seconds": 2},
+        {"name": "打开日期切换按钮（7天）", "xpath": '(//button[@class="andes-dropdown__trigger"])[1]', "wait_seconds": 1},
+        {"name": "选择最近7天", "xpath": '//li[contains(@id, "option-lastSevenDays")]', "wait_seconds": 2},
     ],
     "30天": [
-        {"name": "切换到30天数据", "xpath": "", "wait_seconds": 2},
+        {"name": "打开日期切换按钮（30天）", "xpath": '(//button[@class="andes-dropdown__trigger"])[1]', "wait_seconds": 1},
+        {"name": "选择最近30天", "xpath": '//li[contains(@id, "option-lastMonth")]', "wait_seconds": 2},
     ],
 }
 
 
-# 每个指标单独配置 XPath 和数据类型，故意全部留空，等待用户根据实际页面填写。
+# 每个指标单独配置 XPath 和数据类型。字段名必须与美客多飞书 32 字段保持一致。
 # kind 可选：currency=货币、integer=整数、percent=百分数。
 # currency_code 按用户要求固定为巴西雷亚尔 BRL。
 METRIC_SPECS: list[dict[str, str]] = [
@@ -79,9 +70,9 @@ METRIC_SPECS: list[dict[str, str]] = [
     {"period": "7天", "field": "7天退货价值", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][11]//p[@class="metrics-amount-container__value"]', "kind": "currency", "currency_code": "BRL"},
     {"period": "7天", "field": "7天独特的参观", "xpath": '(//div[contains(@class,"metrics-funnel__series-circles")])[1]//span[contains(@class,"andes-typography--color-primary")]', "kind": "integer"},
     {"period": "7天", "field": "7天购买意向", "xpath": '(//div[contains(@class,"metrics-funnel__series-circles")])[2]//span[contains(@class,"andes-typography--color-primary")]', "kind": "integer"},
-    {"period": "7天", "field": "7天总转换率", "xpath": '//div[contains(@class,"metrics-funnel__summary-primary")]//span[contains(@class,"andes-typography--color-primary")]', "kind": "percent"},
-    {"period": "7天", "field": "7天独立意向转换率", "xpath": '//div[@id="_r_gj_"]//p[@class="andes-badge__content"]', "kind": "percent"},
-    {"period": "7天", "field": "7天意向购买转换率", "xpath": '//div[@id="_r_gm_"]//p[@class="andes-badge__content"]', "kind": "percent"},
+    {"period": "7天", "field": "7天总转换率", "xpath": '(//div[@class="metrics-funnel__pills-section"]//p)[1]', "kind": "percent"},
+    {"period": "7天", "field": "7天独立意向转换率", "xpath": '(//div[@class="metrics-funnel__pills-section"]//p)[2]', "kind": "percent"},
+    {"period": "7天", "field": "7天意向购买转换率", "xpath": '(//div[@class="metrics-funnel__pills-section"]//p)[3]', "kind": "percent"},
     {"period": "30天", "field": "30天总销售额", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][1]//p[@class="metrics-amount-container__value"]', "kind": "currency", "currency_code": "BRL"},
     {"period": "30天", "field": "30天已售件数", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][2]//p[@class="metrics-amount-container__value"]', "kind": "integer"},
     {"period": "30天", "field": "30天平均单价", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][3]//p[@class="metrics-amount-container__value"]', "kind": "currency", "currency_code": "BRL"},
@@ -94,9 +85,9 @@ METRIC_SPECS: list[dict[str, str]] = [
     {"period": "30天", "field": "30天退货价值", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][11]//p[@class="metrics-amount-container__value"]', "kind": "currency", "currency_code": "BRL"},
     {"period": "30天", "field": "30天独特的参观", "xpath": '(//div[contains(@class,"metrics-funnel__series-circles")])[1]//span[contains(@class,"andes-typography--color-primary")]', "kind": "integer"},
     {"period": "30天", "field": "30天购买意向", "xpath": '(//div[contains(@class,"metrics-funnel__series-circles")])[2]//span[contains(@class,"andes-typography--color-primary")]', "kind": "integer"},
-    {"period": "30天", "field": "30天总转换率", "xpath": '//div[contains(@class,"metrics-funnel__summary-primary")]//span[contains(@class,"andes-typography--color-primary")]', "kind": "percent"},
-    {"period": "30天", "field": "30天独立意向转换率", "xpath": '//div[@id="_r_gj_"]//p[@class="andes-badge__content"]', "kind": "percent"},
-    {"period": "30天", "field": "30天意向购买转换率", "xpath": '//div[@id="_r_gm_"]//p[@class="andes-badge__content"]', "kind": "percent"}
+    {"period": "30天", "field": "30天总转换率", "xpath": '(//div[@class="metrics-funnel__pills-section"]//p)[1]', "kind": "percent"},
+    {"period": "30天", "field": "30天独立意向转换率", "xpath": '(//div[@class="metrics-funnel__pills-section"]//p)[2]', "kind": "percent"},
+    {"period": "30天", "field": "30天意向购买转换率", "xpath": '(//div[@class="metrics-funnel__pills-section"]//p)[3]', "kind": "percent"}
 ]
 
 
@@ -108,7 +99,7 @@ class MercadoAuto:
         self.config = config or {}
 
     def collect(self, store_name: str, download_path: str = "", debugging_port: int | str | None = None) -> list[dict[str, Any]]:
-        """接管紫鸟当前标签页，读取 28 个指标并返回一条多字段记录。"""
+        """接管紫鸟当前标签页，读取 7 天和 30 天共 30 个指标。"""
         if not debugging_port:
             raise RuntimeError("紫鸟没有返回 debuggingPort，无法接管美客多店铺")
 
@@ -131,35 +122,55 @@ class MercadoAuto:
 
         # 指标按钮已可见时直接点击；不可见时先展开销售量菜单，再点击指标。
         next_after_metrics = (
-            self._first_step_xpath(COMMON_CLICK_STEPS)
-            or self._first_step_xpath(PERIOD_CLICK_STEPS.get("7天", []))
+            self._first_step_xpath(PERIOD_CLICK_STEPS.get("7天", []))
             or self._first_metric_xpath("7天")
         )
         self._enter_metrics_page(tab, next_after_metrics)
 
-        # 预留的其他页面步骤仍可单独填写，之后分别读取 7 天和 30 天指标。
-        next_after_common = self._first_step_xpath(PERIOD_CLICK_STEPS.get("7天", [])) or self._first_metric_xpath("7天")
-        self._run_click_steps(tab, COMMON_CLICK_STEPS, next_after_common)
+        # 严格按 7 天 -> 读取全部 7 天指标 -> 30 天 -> 读取全部 30 天指标执行。
         for period in ("7天", "30天"):
             LOGGER.info("[美客多][指标] 开始切换并采集时间范围=%s", period)
-            self._run_click_steps(tab, PERIOD_CLICK_STEPS.get(period, []), self._first_metric_xpath(period))
+            # 最后一个日期选项点击后不使用仍存在的旧指标元素判断刷新状态，
+            # final_next_xpath 留空会触发固定等待 30 秒，确保该时间范围的数据加载完成。
+            self._run_click_steps(tab, PERIOD_CLICK_STEPS.get(period, []), final_next_xpath="")
             for spec in METRIC_SPECS:
                 if spec["period"] != period:
                     continue
                 field_name = spec["field"]
                 xpath = spec["xpath"]
+                value_kind = spec["kind"]
+                currency_code = spec.get("currency_code", "")
+                LOGGER.info(
+                    "[美客多][指标] 准备读取：时间范围=%s，字段=%s，配置类型=%s，币种=%s，xpath=%s",
+                    period,
+                    field_name,
+                    value_kind,
+                    currency_code or "无",
+                    xpath or "<空 XPath>",
+                )
                 raw_text = self._read_xpath(tab, xpath, field_name)
-                converted_value = self._format_value(raw_text, spec["kind"])
+                converted_value = self._format_value(raw_text, value_kind)
                 raw_values[field_name] = raw_text
                 feishu_fields[field_name] = converted_value
                 LOGGER.info(
-                    "[美客多][指标结果] 字段=%s，原始值=%r，转换值=%r，转换后类型=%s，配置类型=%s",
+                    "[美客多][指标结果] 字段=%s，原始值=%r，原始类型=%s，转换值=%r，转换后类型=%s，配置类型=%s，币种=%s",
                     field_name,
                     raw_text,
+                    type(raw_text).__name__,
                     converted_value,
                     type(converted_value).__name__,
-                    spec["kind"],
+                    value_kind,
+                    currency_code or "无",
                 )
+                if raw_text == "":
+                    LOGGER.warning("[美客多][指标失败] 字段=%s，XPath 未抓到有效文本，最终按空值处理", field_name)
+                elif converted_value == "":
+                    LOGGER.warning(
+                        "[美客多][转换失败] 字段=%s，已抓到原始值=%r，但无法按配置类型=%s 转换，最终按空值处理",
+                        field_name,
+                        raw_text,
+                        value_kind,
+                    )
 
         # “飞书字段”由 orchestrator 合并进已建立的同名多维表字段。
         # 标准字段仍保留，便于历史电子表和旧版数据表兼容。
@@ -173,6 +184,7 @@ class MercadoAuto:
             "飞书字段": feishu_fields,
         }
         valid_count = sum(value != "" for value in feishu_fields.values())
+        LOGGER.info("[美客多][结果打包] row=%s", json.dumps(row, ensure_ascii=False, default=str))
         LOGGER.info("[美客多][完成] 店铺=%s，有效指标=%s/%s", store_name, valid_count, len(feishu_fields))
         return [row]
 
@@ -386,27 +398,45 @@ class MercadoAuto:
                 return spec["xpath"]
         return ""
 
-    @staticmethod
-    def _read_xpath(tab: Any, xpath: str, field_name: str = "未命名指标") -> str:
+    def _read_xpath(self, tab: Any, xpath: str, field_name: str = "未命名指标") -> str:
         """读取一个 XPath 文本；XPath 为空、元素不存在或异常时返回空字符串。"""
         if not xpath:
             LOGGER.warning("[美客多][指标跳过] 字段=%s，原因=XPath 为空", field_name)
             return ""
-        try:
-            element = tab.ele(f"xpath:{xpath}", timeout=3)
-            if not element:
-                LOGGER.warning("[美客多][指标未找到] 字段=%s，xpath=%s", field_name, xpath)
-                return ""
-            raw_text = str(element.text or "").strip()
-            LOGGER.info("[美客多][指标抓取] 字段=%s，原始文本=%r，xpath=%s", field_name, raw_text, xpath)
-            return raw_text
-        except Exception as exc:
-            LOGGER.warning("[美客多][指标异常] 字段=%s，异常=%s，xpath=%s", field_name, exc, xpath)
-            return ""
+        for attempt in range(2):
+            if attempt > 0:
+                LOGGER.warning(
+                    "[美客多][指标重试] 字段=%s，第 2/2 次读取前等待 %s 秒，xpath=%s",
+                    field_name,
+                    CLICK_RETRY_INTERVAL_SECONDS,
+                    xpath,
+                )
+                time.sleep(CLICK_RETRY_INTERVAL_SECONDS)
+            try:
+                LOGGER.info("[美客多][指标查找] 字段=%s，第 %s/2 次读取，xpath=%s", field_name, attempt + 1, xpath)
+                element = tab.ele(f"xpath:{xpath}", timeout=3)
+                if element:
+                    raw_text = str(element.text or "").strip()
+                    if raw_text:
+                        LOGGER.info("[美客多][指标抓取成功] 字段=%s，原始文本=%r", field_name, raw_text)
+                        return raw_text
+                    LOGGER.warning("[美客多][指标文本为空] 字段=%s，已找到元素但 text 为空", field_name)
+                else:
+                    LOGGER.warning("[美客多][指标未找到] 字段=%s，第 %s/2 次未找到元素", field_name, attempt + 1)
+            except Exception as exc:
+                LOGGER.warning(
+                    "[美客多][指标异常] 字段=%s，第 %s/2 次读取失败，异常=%s，xpath=%s",
+                    field_name,
+                    attempt + 1,
+                    exc,
+                    xpath,
+                )
+        LOGGER.error("[美客多][指标最终失败] 字段=%s，两次读取均未得到有效文本，返回空字符串", field_name)
+        return ""
 
     @staticmethod
     def _format_value(raw_text: str, kind: str) -> Any:
-        """按字段类型转换数据：货币两位小数、整数无小数、百分数无小数。"""
+        """按字段类型转换数据：货币两位小数、整数无小数、进度为数值比例。"""
         if not raw_text:
             return ""
         if kind == "integer":
@@ -424,8 +454,10 @@ class MercadoAuto:
         if kind == "currency":
             return round(number, 2)
         if kind == "percent":
-            # 页面通常带 %，飞书字段直接保存为“15%”这种无小数百分数文本。
-            return f"{round(number):.0f}%"
+            # 飞书“进度/百分比”字段必须接收数值比例，不能发送 "15%" 文本。
+            # 页面 12.5% 转为 0.125，飞书按字段配置显示为 12.5%。
+            ratio = number / 100 if "%" in str(raw_text) or abs(number) > 1 else number
+            return round(ratio, 4)
         return raw_text
 
     @staticmethod

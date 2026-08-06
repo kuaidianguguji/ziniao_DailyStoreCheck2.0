@@ -66,6 +66,58 @@ TIKTOK_FORMULA_FIELDS: frozenset[str] = frozenset(
 )
 
 
+# 美客多多维表和历史电子表的固定 32 字段顺序。
+# 多维表只接收这些已建立字段，避免通用“指标/数值/原始数据”导致 WrongRequestBody。
+MERCADO_TABLE_FIELD_ORDER: tuple[str, ...] = (
+    "7天取消的销售数量",
+    "30天取消的销售价值",
+    "7天转换率",
+    "30天已售件数",
+    "30天购买意向",
+    "7天意向购买转换率",
+    "30天退货价值",
+    "7天已售件数",
+    "7天退货价值",
+    "7天平均单价",
+    "店铺名",
+    "7天总销售额",
+    "7天独立意向转换率",
+    "7天独特的参观",
+    "7天取消的销售价值",
+    "7天购买意向",
+    "7天销售量",
+    "30天意向购买转换率",
+    "7天退货数量",
+    "30天访问",
+    "30天总销售额",
+    "30天独特的参观",
+    "7天访问",
+    "30天取消的销售数量",
+    "30天独立意向转换率",
+    "采集时间",
+    "30天转换率",
+    "30天退货数量",
+    "30天平均单价",
+    "30天销售量",
+    "7天总转换率",
+    "30天总转换率",
+)
+
+# 机器人消息需要把内部数值比例重新显示成人能直接阅读的百分比。
+MERCADO_PROGRESS_FIELDS: frozenset[str] = frozenset(
+    {
+        "7天转换率",
+        "7天意向购买转换率",
+        "7天独立意向转换率",
+        "30天意向购买转换率",
+        "30天独立意向转换率",
+        "30天转换率",
+        "7天总转换率",
+        "30天总转换率",
+    }
+)
+
+
 class DailyStoreCheck:
     """控制表 -> 紫鸟单店铺 -> 平台爬虫 -> 飞书写入/推送的主流程。"""
 
@@ -153,6 +205,8 @@ class DailyStoreCheck:
         app_token, table_id = self.feishu.get_bitable_ref("data", task.platform)
         if task.platform == "tiktok":
             record_rows, spreadsheet_rows = self._build_tiktok_feishu_rows(task, rows)
+        elif task.platform == "mercado":
+            record_rows, spreadsheet_rows = self._build_mercado_feishu_rows(task, rows)
         else:
             record_rows, spreadsheet_rows = self._build_default_feishu_rows(task, rows)
 
@@ -168,7 +222,9 @@ class DailyStoreCheck:
         if isinstance(spreadsheet_cfg, dict):
             token = str(spreadsheet_cfg.get("token") or spreadsheet_cfg.get("spreadsheet_token") or "")
             sheet_id = str(spreadsheet_cfg.get("sheet_id") or "")
-            range_name = str(spreadsheet_cfg.get("range") or (f"{sheet_id}!A:AG" if sheet_id and task.platform == "tiktok" else f"{sheet_id}!A:Z" if sheet_id else "Sheet1!A:Z"))
+            range_end_by_platform = {"tiktok": "AG", "mercado": "AF"}
+            range_end = range_end_by_platform.get(task.platform, "Z")
+            range_name = str(spreadsheet_cfg.get("range") or (f"{sheet_id}!A:{range_end}" if sheet_id else f"Sheet1!A:{range_end}"))
             self.feishu.append_spreadsheet_rows(token, spreadsheet_rows, range_name)
         else:
             self.feishu.append_spreadsheet_rows(str(spreadsheet_cfg), spreadsheet_rows)
@@ -193,7 +249,7 @@ class DailyStoreCheck:
                 fields.get("value", "数值"): row.get("数值", ""),
                 fields.get("raw_data", "原始数据"): row.get("原始数据", ""),
             }
-            # 平台可以提供自己的字段字典。美客多用它写入已建立的 28 个同名字段，
+            # 平台可以提供自己的字段字典。美客多使用独立的 32 字段打包逻辑，
             # 其他平台没有该字段时仍沿用上面的通用结构。
             platform_fields = row.get("飞书字段", {})
             if isinstance(platform_fields, dict):
@@ -285,6 +341,61 @@ class DailyStoreCheck:
         spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in TIKTOK_TABLE_FIELD_ORDER]
         return [bitable_record], [spreadsheet_row]
 
+    def _build_mercado_feishu_rows(
+        self,
+        task: StoreTask,
+        rows: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[list[Any]]]:
+        """把美客多爬虫结果转换成一条严格匹配 32 字段表结构的记录。"""
+        merged_fields: dict[str, Any] = {}
+        collected_at: Any = ""
+        for row_index, row in enumerate(rows, start=1):
+            if not collected_at and row.get("采集时间"):
+                collected_at = row["采集时间"]
+            platform_fields = row.get("飞书字段", {})
+            if not isinstance(platform_fields, dict):
+                LOGGER.warning("[飞书][MKD打包] 第 %s 条爬虫结果的 飞书字段 不是字典，已跳过", row_index)
+                continue
+            for field_name, value in platform_fields.items():
+                if value not in ("", None) or field_name not in merged_fields:
+                    merged_fields[field_name] = value
+
+        if not collected_at:
+            collected_at = datetime.now(timezone.utc).isoformat()
+
+        known_fields = set(MERCADO_TABLE_FIELD_ORDER)
+        unknown_fields = sorted(set(merged_fields) - known_fields)
+        if unknown_fields:
+            LOGGER.warning("[飞书][MKD未知字段] 以下字段不在 32 字段定义中，不写入多维表：%s", unknown_fields)
+
+        # 数字、货币和进度字段都不能发送空字符串；空指标直接从 JSON 中省略。
+        bitable_record: dict[str, Any] = {
+            "店铺名": task.store_name,
+            "采集时间": self._to_feishu_timestamp_ms(collected_at),
+        }
+        for field_name in MERCADO_TABLE_FIELD_ORDER:
+            if field_name in {"店铺名", "采集时间"}:
+                continue
+            value = merged_fields.get(field_name, "")
+            if value not in ("", None):
+                bitable_record[field_name] = value
+
+        missing_fields = [
+            field_name
+            for field_name in MERCADO_TABLE_FIELD_ORDER
+            if field_name not in {"店铺名", "采集时间"}
+            and merged_fields.get(field_name, "") in ("", None)
+        ]
+        if missing_fields:
+            LOGGER.warning("[飞书][MKD空字段] 以下字段本次无数据，不放入多维表请求体：%s", missing_fields)
+
+        # 电子表固定追加 32 列，并保留 ISO 采集时间方便人工查看。
+        spreadsheet_values = dict(merged_fields)
+        spreadsheet_values["店铺名"] = task.store_name
+        spreadsheet_values["采集时间"] = collected_at
+        spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in MERCADO_TABLE_FIELD_ORDER]
+        return [bitable_record], [spreadsheet_row]
+
     @staticmethod
     def _to_feishu_timestamp_ms(value: Any) -> int:
         """把 ISO 日期、秒级时间戳或毫秒时间戳统一转换成飞书日期字段需要的毫秒整数。"""
@@ -330,6 +441,24 @@ class DailyStoreCheck:
             # 多维表之外的新抓取字段也附在机器人消息末尾，避免调试时看不到数据。
             extra_fields = sorted(set(merged_fields) - set(TIKTOK_TABLE_FIELD_ORDER))
             lines = [f"{field_name}: {merged_fields[field_name]}" for field_name in ordered_fields + extra_fields]
+            return "\n".join(lines) if lines else "本次未抓取到有效指标，空值不会写入飞书数值字段。"
+        if any(row.get("平台") == "mercado" for row in rows):
+            merged_fields: dict[str, Any] = {}
+            for row in rows:
+                platform_fields = row.get("飞书字段", {})
+                if isinstance(platform_fields, dict):
+                    for field_name, value in platform_fields.items():
+                        if value not in ("", None):
+                            merged_fields[field_name] = value
+            lines: list[str] = []
+            for field_name in MERCADO_TABLE_FIELD_ORDER:
+                if field_name not in merged_fields:
+                    continue
+                value = merged_fields[field_name]
+                if field_name in MERCADO_PROGRESS_FIELDS and isinstance(value, (int, float)):
+                    lines.append(f"{field_name}: {value * 100:.1f}%")
+                else:
+                    lines.append(f"{field_name}: {value}")
             return "\n".join(lines) if lines else "本次未抓取到有效指标，空值不会写入飞书数值字段。"
         lines = []
         for row in rows[:20]:
