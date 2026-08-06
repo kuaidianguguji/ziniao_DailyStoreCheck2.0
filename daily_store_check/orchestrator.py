@@ -14,6 +14,58 @@ from .ziniao_client import ZiniaoClient, ZiniaoStoreSession
 LOGGER = logging.getLogger(__name__)
 
 
+# TikTok 多维表和历史电子表的固定字段顺序，与用户建立的 33 个字段完全一致。
+# 电子表按此顺序追加，避免使用字典插入顺序导致不同采集模块的列发生错位。
+TIKTOK_TABLE_FIELD_ORDER: tuple[str, ...] = (
+    "店铺名",
+    "直播GMV",
+    "短视频GMV",
+    "7天均单价",
+    "昨天ROI",
+    "昨天订单数",
+    "昨天GMV视频比",
+    "7天订单数",
+    "昨天总收入",
+    "昨天SKU订单数",
+    "7天GMV",
+    "昨天商品访客数",
+    "昨天曝光数",
+    "7天成交件数",
+    "7天曝光数",
+    "7天成本",
+    "昨天GMV直播比",
+    "采集时间",
+    "昨天GMV商品卡比",
+    "7天总收入",
+    "昨天成本",
+    "7天GMV直播比",
+    "商品卡GMV",
+    "昨天客户数",
+    "昨天去重曝光数",
+    "7天客户数",
+    "7天ROI",
+    "昨天GMV",
+    "7天商品访客数",
+    "7天去重曝光数",
+    "昨天均单价",
+    "昨天成交件数",
+    "7天SKU订单数",
+)
+
+# 飞书多维表的公式字段由飞书自己计算，调用新增记录接口时不能赋值。
+# 这些字段的爬虫原始结果仍会写入历史电子表和机器人消息，方便核对公式。
+TIKTOK_FORMULA_FIELDS: frozenset[str] = frozenset(
+    {
+        "昨天ROI",
+        "昨天GMV视频比",
+        "昨天GMV直播比",
+        "昨天GMV商品卡比",
+        "7天GMV直播比",
+        "7天ROI",
+    }
+)
+
+
 class DailyStoreCheck:
     """控制表 -> 紫鸟单店铺 -> 平台爬虫 -> 飞书写入/推送的主流程。"""
 
@@ -66,6 +118,12 @@ class DailyStoreCheck:
     def _safe_notify(self, recipient: str, title: str, content: str) -> None:
         """推送失败只记录日志，不影响关闭店铺和后续店铺。"""
         try:
+            LOGGER.info(
+                "[飞书][机器人消息打包] recipient=%s，title=%r，content=%r",
+                recipient or "<空接收人>",
+                title,
+                content,
+            )
             self.feishu.send_robot_message(recipient, title, content)
         except Exception:
             LOGGER.exception("飞书消息推送失败 recipient=%s", recipient)
@@ -92,16 +150,45 @@ class DailyStoreCheck:
     def _write_feishu(self, task: StoreTask, rows: list[dict[str, Any]]) -> None:
         """把标准行写入对应多维表，并追加到对应历史电子表。"""
         feishu_cfg = self.config.get("feishu", {})
-        bitable = feishu_cfg.get("bitable", {})
         app_token, table_id = self.feishu.get_bitable_ref("data", task.platform)
+        if task.platform == "tiktok":
+            record_rows, spreadsheet_rows = self._build_tiktok_feishu_rows(task, rows)
+        else:
+            record_rows, spreadsheet_rows = self._build_default_feishu_rows(task, rows)
+
+        LOGGER.info(
+            "[飞书][传输准备] 店铺=%s，平台=%s，多维表记录数=%s，电子表行数=%s",
+            task.store_name,
+            task.platform,
+            len(record_rows),
+            len(spreadsheet_rows),
+        )
+        self.feishu.batch_create_records(table_id, record_rows, app_token=app_token)
+        spreadsheet_cfg = feishu_cfg.get("spreadsheets", {}).get(task.platform, "")
+        if isinstance(spreadsheet_cfg, dict):
+            token = str(spreadsheet_cfg.get("token") or spreadsheet_cfg.get("spreadsheet_token") or "")
+            sheet_id = str(spreadsheet_cfg.get("sheet_id") or "")
+            range_name = str(spreadsheet_cfg.get("range") or (f"{sheet_id}!A:AG" if sheet_id and task.platform == "tiktok" else f"{sheet_id}!A:Z" if sheet_id else "Sheet1!A:Z"))
+            self.feishu.append_spreadsheet_rows(token, spreadsheet_rows, range_name)
+        else:
+            self.feishu.append_spreadsheet_rows(str(spreadsheet_cfg), spreadsheet_rows)
+
+    def _build_default_feishu_rows(
+        self,
+        task: StoreTask,
+        rows: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[list[Any]]]:
+        """为 Shopee 和 Mercado 保留原有通用字段打包方式。"""
+        bitable = self.config.get("feishu", {}).get("bitable", {})
         fields = bitable.get("data_fields", {})
         now = datetime.now(timezone.utc).isoformat()
         record_rows: list[dict[str, Any]] = []
         spreadsheet_rows: list[list[Any]] = []
         for row in rows:
+            collected_at = row.get("采集时间", now)
             record = {
                 fields.get("store_name", "店铺名"): row.get("店铺名", task.store_name),
-                fields.get("collected_at", "采集时间"): row.get("采集时间", now),
+                fields.get("collected_at", "采集时间"): self._to_feishu_timestamp_ms(collected_at),
                 fields.get("metric", "指标"): row.get("指标", ""),
                 fields.get("value", "数值"): row.get("数值", ""),
                 fields.get("raw_data", "原始数据"): row.get("原始数据", ""),
@@ -110,11 +197,12 @@ class DailyStoreCheck:
             # 其他平台没有该字段时仍沿用上面的通用结构。
             platform_fields = row.get("飞书字段", {})
             if isinstance(platform_fields, dict):
-                record.update(platform_fields)
+                # 空字符串不能写入飞书数字、货币、百分比等字段，因此空指标不进入请求体。
+                record.update({name: value for name, value in platform_fields.items() if value not in ("", None)})
             record_rows.append(record)
             spreadsheet_row = [
                 record.get(fields.get("store_name", "店铺名")),
-                record.get(fields.get("collected_at", "采集时间")),
+                collected_at,
                 task.platform,
                 record.get(fields.get("metric", "指标")),
                 record.get(fields.get("value", "数值")),
@@ -123,15 +211,95 @@ class DailyStoreCheck:
             if isinstance(platform_fields, dict):
                 spreadsheet_row.extend(platform_fields.values())
             spreadsheet_rows.append(spreadsheet_row)
-        self.feishu.batch_create_records(table_id, record_rows, app_token=app_token)
-        spreadsheet_cfg = feishu_cfg.get("spreadsheets", {}).get(task.platform, "")
-        if isinstance(spreadsheet_cfg, dict):
-            token = str(spreadsheet_cfg.get("token") or spreadsheet_cfg.get("spreadsheet_token") or "")
-            sheet_id = str(spreadsheet_cfg.get("sheet_id") or "")
-            range_name = str(spreadsheet_cfg.get("range") or (f"{sheet_id}!A:Z" if sheet_id else "Sheet1!A:Z"))
-            self.feishu.append_spreadsheet_rows(token, spreadsheet_rows, range_name)
-        else:
-            self.feishu.append_spreadsheet_rows(str(spreadsheet_cfg), spreadsheet_rows)
+        return record_rows, spreadsheet_rows
+
+    def _build_tiktok_feishu_rows(
+        self,
+        task: StoreTask,
+        rows: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[list[Any]]]:
+        """把 TikTok 广告和概览结果合并成一条 33 字段记录。"""
+        merged_fields: dict[str, Any] = {}
+        collected_at: Any = ""
+        for row_index, row in enumerate(rows, start=1):
+            if not collected_at and row.get("采集时间"):
+                collected_at = row["采集时间"]
+            platform_fields = row.get("飞书字段", {})
+            if not isinstance(platform_fields, dict):
+                LOGGER.warning("[飞书][TK打包] 第 %s 条爬虫结果的 飞书字段 不是字典，已跳过", row_index)
+                continue
+            for field_name, value in platform_fields.items():
+                previous_value = merged_fields.get(field_name, "")
+                if previous_value not in ("", None) and value not in ("", None) and previous_value != value:
+                    LOGGER.warning(
+                        "[飞书][TK字段冲突] 字段=%s，前一模块值=%r，后一模块值=%r；采用后一模块值",
+                        field_name,
+                        previous_value,
+                        value,
+                    )
+                if value not in ("", None) or field_name not in merged_fields:
+                    merged_fields[field_name] = value
+
+        if not collected_at:
+            collected_at = datetime.now(timezone.utc).isoformat()
+
+        known_fields = set(TIKTOK_TABLE_FIELD_ORDER)
+        unknown_fields = sorted(set(merged_fields) - known_fields)
+        if unknown_fields:
+            LOGGER.warning("[飞书][TK未知字段] 以下字段不在 33 字段定义中，不写入多维表：%s", unknown_fields)
+
+        formula_values = {
+            field_name: merged_fields[field_name]
+            for field_name in TIKTOK_FORMULA_FIELDS
+            if merged_fields.get(field_name) not in ("", None)
+        }
+        if formula_values:
+            LOGGER.info("[飞书][TK公式字段] 公式字段只读，不写入多维表；抓取值仍保留到电子表和机器人：%s", formula_values)
+
+        # 多维表只发送店铺名、毫秒时间戳和非空的可写业务字段。
+        bitable_record: dict[str, Any] = {
+            "店铺名": task.store_name,
+            "采集时间": self._to_feishu_timestamp_ms(collected_at),
+        }
+        for field_name in TIKTOK_TABLE_FIELD_ORDER:
+            if field_name in {"店铺名", "采集时间"} or field_name in TIKTOK_FORMULA_FIELDS:
+                continue
+            value = merged_fields.get(field_name, "")
+            if value not in ("", None):
+                bitable_record[field_name] = value
+
+        missing_fields = [
+            field_name
+            for field_name in TIKTOK_TABLE_FIELD_ORDER
+            if field_name not in {"店铺名", "采集时间"}
+            and field_name not in TIKTOK_FORMULA_FIELDS
+            and merged_fields.get(field_name, "") in ("", None)
+        ]
+        if missing_fields:
+            LOGGER.warning("[飞书][TK空字段] 以下可写字段本次无数据，不放入多维表请求体：%s", missing_fields)
+
+        # 历史电子表保留完整 33 列。公式字段使用本次爬虫读到的值，未抓到的字段写空单元格。
+        spreadsheet_values = dict(merged_fields)
+        spreadsheet_values["店铺名"] = task.store_name
+        spreadsheet_values["采集时间"] = collected_at
+        spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in TIKTOK_TABLE_FIELD_ORDER]
+        return [bitable_record], [spreadsheet_row]
+
+    @staticmethod
+    def _to_feishu_timestamp_ms(value: Any) -> int:
+        """把 ISO 日期、秒级时间戳或毫秒时间戳统一转换成飞书日期字段需要的毫秒整数。"""
+        if isinstance(value, (int, float)) or str(value).strip().isdigit():
+            number = float(value)
+            return int(number if number >= 1_000_000_000_000 else number * 1000)
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return int(parsed.timestamp() * 1000)
+        except (TypeError, ValueError, OSError):
+            fallback = int(datetime.now(timezone.utc).timestamp() * 1000)
+            LOGGER.warning("[飞书][日期转换失败] 原始值=%r，改用当前时间戳=%s", value, fallback)
+            return fallback
 
     def _cleanup_retention(self) -> None:
         """清理三张数据多维表中的旧记录，历史电子表不删除。"""
@@ -150,6 +318,19 @@ class DailyStoreCheck:
         """生成适合机器人阅读的短文本，避免把大段原始数据直接推送。"""
         if not rows:
             return "本次没有采集到数据。"
+        if any(row.get("平台") == "tiktok" for row in rows):
+            merged_fields: dict[str, Any] = {}
+            for row in rows:
+                platform_fields = row.get("飞书字段", {})
+                if isinstance(platform_fields, dict):
+                    for field_name, value in platform_fields.items():
+                        if value not in ("", None):
+                            merged_fields[field_name] = value
+            ordered_fields = [field_name for field_name in TIKTOK_TABLE_FIELD_ORDER if field_name in merged_fields]
+            # 多维表之外的新抓取字段也附在机器人消息末尾，避免调试时看不到数据。
+            extra_fields = sorted(set(merged_fields) - set(TIKTOK_TABLE_FIELD_ORDER))
+            lines = [f"{field_name}: {merged_fields[field_name]}" for field_name in ordered_fields + extra_fields]
+            return "\n".join(lines) if lines else "本次未抓取到有效指标，空值不会写入飞书数值字段。"
         lines = []
         for row in rows[:20]:
             platform_fields = row.get("飞书字段", {})

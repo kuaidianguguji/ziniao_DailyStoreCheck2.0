@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
@@ -55,12 +56,86 @@ class FeishuClient:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         """统一发送请求并检查飞书 code，避免每个接口重复写错误处理。"""
-        response = self.session.request(method, f"{self.base_url}{path}", timeout=self.timeout, **kwargs)
-        response.raise_for_status()
-        payload = response.json()
+        safe_path = self._safe_path_for_log(path)
+        request_log = {
+            "params": kwargs.get("params", {}),
+            "json": kwargs.get("json", {}),
+        }
+        LOGGER.info(
+            "[飞书][HTTP请求] method=%s，path=%s，request=%s",
+            method.upper(),
+            safe_path,
+            self._json_for_log(request_log),
+        )
+        try:
+            response = self.session.request(method, f"{self.base_url}{path}", timeout=self.timeout, **kwargs)
+            response.raise_for_status()
+        except requests.RequestException:
+            LOGGER.exception("[飞书][HTTP异常] method=%s，path=%s", method.upper(), safe_path)
+            raise
+        try:
+            payload = response.json()
+        except ValueError:
+            LOGGER.error(
+                "[飞书][响应解析失败] method=%s，path=%s，status=%s，response_text=%r",
+                method.upper(),
+                safe_path,
+                response.status_code,
+                response.text[:2000],
+            )
+            raise
         if payload.get("code", 0) != 0:
+            LOGGER.error(
+                "[飞书][业务失败] method=%s，path=%s，code=%s，msg=%s，完整响应=%s，请求JSON=%s",
+                method.upper(),
+                safe_path,
+                payload.get("code"),
+                payload.get("msg"),
+                self._json_for_log(payload),
+                self._json_for_log(kwargs.get("json", {})),
+            )
             raise RuntimeError(f"飞书接口失败 code={payload.get('code')} msg={payload.get('msg')}")
+        response_summary: dict[str, Any] = {"code": payload.get("code", 0), "msg": payload.get("msg", "")}
+        data = payload.get("data")
+        if isinstance(data, dict):
+            if isinstance(data.get("items"), list):
+                response_summary["items_count"] = len(data["items"])
+            if isinstance(data.get("records"), list):
+                response_summary["records_count"] = len(data["records"])
+            if "has_more" in data:
+                response_summary["has_more"] = data.get("has_more")
+        LOGGER.info("[飞书][HTTP成功] method=%s，path=%s，response=%s", method.upper(), safe_path, self._json_for_log(response_summary))
         return payload
+
+    @classmethod
+    def _safe_log_value(cls, value: Any, parent_key: str = "") -> Any:
+        """递归脱敏日志中的密钥、访问令牌和签名，同时保留业务字段内容。"""
+        sensitive_keys = {
+            "app_secret",
+            "tenant_access_token",
+            "authorization",
+            "sign",
+            "sign_secret",
+            "webhook_url",
+        }
+        if parent_key.lower() in sensitive_keys:
+            return "***"
+        if isinstance(value, dict):
+            return {key: cls._safe_log_value(item, str(key)) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._safe_log_value(item, parent_key) for item in value]
+        return value
+
+    @classmethod
+    def _json_for_log(cls, value: Any) -> str:
+        """把请求或响应转换成单行中文 JSON，遇到非标准对象时使用字符串表示。"""
+        return json.dumps(cls._safe_log_value(value), ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _safe_path_for_log(path: str) -> str:
+        """隐藏 URL 路径中的多维表 app_token 和电子表 spreadsheet_token。"""
+        safe_path = re.sub(r"(/bitable/v1/apps/)[^/]+", r"\1***", path)
+        return re.sub(r"(/spreadsheets/)[^/]+", r"\1***", safe_path)
 
     def _get_tenant_token(self) -> str:
         """按需获取 tenant_access_token，并在进程内复用。"""
@@ -142,7 +217,7 @@ class FeishuClient:
         app_token, table_id = self.get_bitable_ref("control")
         records = self.list_records(table_id, app_token=app_token)
         tasks: list[StoreTask] = []
-        print(f'---test----records:{records}')
+        LOGGER.info("[飞书][控制表] 读取记录数=%s", len(records))
         for record in records:
             raw = record.get("fields", {})
             store_name = str(self._field_value(raw.get(fields.get("store_name", "店铺名称"), "")) or "").strip()
@@ -169,7 +244,21 @@ class FeishuClient:
             return
         for start in range(0, len(row_list), 500):
             chunk = row_list[start:start + 500]
-            self._request("POST", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create", headers=self._headers(), json={"records": [{"fields": row} for row in chunk]})
+            request_body = {"records": [{"fields": row} for row in chunk]}
+            LOGGER.info(
+                "[飞书][多维表JSON] table_id=%s，批次=%s-%s，总记录数=%s，body=%s",
+                table_id,
+                start + 1,
+                start + len(chunk),
+                len(row_list),
+                self._json_for_log(request_body),
+            )
+            self._request(
+                "POST",
+                f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create",
+                headers=self._headers(),
+                json=request_body,
+            )
 
     def remove_old_records(self, table_id: str, collected_field: str, retention_days: int, app_token: str = "") -> int:
         """删除数据多维表中超过保留期的记录，返回删除条数。"""
@@ -201,7 +290,20 @@ class FeishuClient:
         if not self.configured or not spreadsheet_token:
             LOGGER.warning("飞书电子表未配置，跳过追加 rows=%s", len(rows))
             return
-        self._request("POST", f"/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values_append", headers=self._headers(), json={"valueRange": {"range": range_name, "values": rows}})
+        request_body = {"valueRange": {"range": range_name, "values": rows}}
+        LOGGER.info(
+            "[飞书][电子表JSON] range=%s，行数=%s，列数=%s，body=%s",
+            range_name,
+            len(rows),
+            max((len(row) for row in rows), default=0),
+            self._json_for_log(request_body),
+        )
+        self._request(
+            "POST",
+            f"/open-apis/sheets/v2/spreadsheets/{spreadsheet_token}/values_append",
+            headers=self._headers(),
+            json=request_body,
+        )
 
     def send_robot_message(self, recipient: str, title: str, content: str) -> None:
         """优先使用应用机器人按 open_id 定向推送，否则使用 webhook。"""
@@ -209,12 +311,22 @@ class FeishuClient:
         if recipients and self.config.get("app_id") and self.config.get("app_secret"):
             receive_id_type = self.config.get("robot", {}).get("receive_id_type", "open_id")
             for receive_id in recipients:
+                request_body = {
+                    "receive_id": receive_id,
+                    "msg_type": "text",
+                    "content": json.dumps({"text": f"{title}\n{content}"}, ensure_ascii=False),
+                }
+                LOGGER.info(
+                    "[飞书][应用机器人JSON] receive_id_type=%s，body=%s",
+                    receive_id_type,
+                    self._json_for_log(request_body),
+                )
                 self._request(
                     "POST",
                     "/open-apis/im/v1/messages",
                     headers=self._headers(),
                     params={"receive_id_type": receive_id_type},
-                    json={"receive_id": receive_id, "msg_type": "text", "content": json.dumps({"text": f"{title}\n{content}"}, ensure_ascii=False)},
+                    json=request_body,
                 )
             return
         webhook = self.config.get("robot", {}).get("webhook_url", "")
@@ -227,11 +339,14 @@ class FeishuClient:
             timestamp = str(int(time.time()))
             body["timestamp"] = timestamp
             body["sign"] = self._sign(timestamp, secret)
+        LOGGER.info("[飞书][Webhook机器人JSON] body=%s", self._json_for_log(body))
         response = requests.post(webhook, json=body, timeout=self.timeout)
         response.raise_for_status()
         result = response.json()
         if result.get("code", 0) != 0:
+            LOGGER.error("[飞书][Webhook机器人失败] response=%s", self._json_for_log(result))
             raise RuntimeError(f"飞书机器人推送失败: {result}")
+        LOGGER.info("[飞书][Webhook机器人成功] response=%s", self._json_for_log(result))
 
     @staticmethod
     def _sign(timestamp: str, secret: str) -> str:
