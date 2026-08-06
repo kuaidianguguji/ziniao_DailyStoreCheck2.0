@@ -30,6 +30,7 @@ COMMON_CLICK_STEPS: list[dict[str, Any]] = [
 ]
 
 
+
 # 统计页面中的时间范围切换步骤。
 # 采集 7 天指标前执行 PERIOD_CLICK_STEPS["7天"]；
 # 采集完 7 天指标后执行 PERIOD_CLICK_STEPS["30天"]，再读取 30 天指标。

@@ -97,6 +97,8 @@ ziniao_DailyStoreCheck_codex_two/
 - `MKD_auto.py` 还提供 `COMMON_CLICK_STEPS` 和 `PERIOD_CLICK_STEPS`：前者填写进入数据页面所需的菜单点击，后者填写 7 天/30 天切换按钮；每组步骤按列表顺序执行，空 XPath 自动跳过。
 - 美客多货币指标按数值保留两位小数，指标定义标记 `currency_code=BRL`；数量为整数，转换率为不带小数的百分数字符串。
 - 美客多返回的 `飞书字段` 会被编排器合并到多维表中的同名字段，历史电子表也会追加这些指标值。
+- `TK_auto.py` 分为“营销 -> 店铺广告”和“数据分析 -> 概览”两条流程，各自提供页面点击步骤、昨天/7天切换步骤和指标 XPath，所有 XPath 初始为空。
+- TikTok 广告金额字段使用 `currency_code=USD`，概览 GMV 使用 `currency_code=BRL`；两个模块分别返回一条记录，避免同名 SKU 订单数字段相互覆盖。
 
 ### `daily_store_check/orchestrator.py`
 
