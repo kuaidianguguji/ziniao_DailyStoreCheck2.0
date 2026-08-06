@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -18,14 +20,30 @@ from typing import Any
 from DrissionPage import Chromium
 
 
-# 进入美客多数据页面前需要执行的点击步骤。
-#
-# 目前不知道你的账号进入数据页需要点哪些菜单，所以这里先准备多个可编辑步骤。
-# 后续只需要把对应 xpath 填入，程序会严格按照列表顺序点击；xpath 为空时自动跳过。
-# 如果实际只需要点击两次，就保留两项；需要更多步骤时继续向列表添加字典即可。
+# 当前模块日志会由 run_daily_store_check.py 同时输出到控制台和日志文件。
+LOGGER = logging.getLogger(__name__)
+
+
+# 美客多首页广告弹窗的关闭按钮。
+HOME_AD_CLOSE_XPATH = '//button[@class="andes-modal__close-button"]'
+
+# 销售量菜单展开按钮和经营指标按钮。
+SALES_SECTION_BUTTON_XPATH = '//input[@id="myml-menu-section-toggle-my_sales"]/ancestor::li[1]//button[@data-section-id="MY_SALES"]//label'
+METRICS_BUTTON_XPATH = '//input[@id="myml-menu-section-toggle-my_sales"]/ancestor::li[1]//div[@data-item-id="MYML_METRICS"]'
+
+# 页面和按钮操作参数。重试次数 3 表示首次点击失败后再重试 3 次。
+PAGE_READY_TIMEOUT_SECONDS = 60
+AFTER_PAGE_READY_WAIT_SECONDS = 10
+CLICK_RETRY_TIMES = 3
+CLICK_RETRY_INTERVAL_SECONDS = 2
+NEXT_ELEMENT_TIMEOUT_SECONDS = 30
+
+
+# 进入美客多数据页面的其他可编辑步骤。
+# “销售量 -> 指标”分支由 collect() 根据指标按钮是否可见自动处理，
+# 因此这里不再重复放置指标 XPath，避免页面状态变化时连续点击错误菜单。
 COMMON_CLICK_STEPS: list[dict[str, Any]] = [
     {"name": "进入经营分析菜单", "xpath": "", "wait_seconds": 1},
-    {"name": "进入广告/销售数据菜单", "xpath": "", "wait_seconds": 1},
     {"name": "进入数据概览页面", "xpath": "", "wait_seconds": 2},
 ]
 
@@ -49,34 +67,36 @@ PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
 # kind 可选：currency=货币、integer=整数、percent=百分数。
 # currency_code 按用户要求固定为巴西雷亚尔 BRL。
 METRIC_SPECS: list[dict[str, str]] = [
-    {"period": "7天", "field": "7天总销售额", "xpath": "", "kind": "currency", "currency_code": "BRL"},
-    {"period": "7天", "field": "7天已售单位", "xpath": "", "kind": "integer"},
-    {"period": "7天", "field": "7天平均单价", "xpath": "", "kind": "currency", "currency_code": "BRL"},
-    {"period": "7天", "field": "7天访问", "xpath": "", "kind": "integer"},
-    {"period": "7天", "field": "7天销售量", "xpath": "", "kind": "integer"},
-    {"period": "7天", "field": "7天转换率", "xpath": "", "kind": "percent"},
-    {"period": "7天", "field": "7天取消的销售数量", "xpath": "", "kind": "integer"},
-    {"period": "7天", "field": "7天取消的销售价值", "xpath": "", "kind": "currency", "currency_code": "BRL"},
-    {"period": "7天", "field": "7天退货数量", "xpath": "", "kind": "integer"},
-    {"period": "7天", "field": "7天退货价值", "xpath": "", "kind": "currency", "currency_code": "BRL"},
-    {"period": "7天", "field": "7天独特的参观", "xpath": "", "kind": "integer"},
-    {"period": "7天", "field": "7天购买意向", "xpath": "", "kind": "integer"},
-    {"period": "7天", "field": "7天独立意向转换率", "xpath": "", "kind": "percent"},
-    {"period": "7天", "field": "7天意向购买转换率", "xpath": "", "kind": "percent"},
-    {"period": "30天", "field": "30天总销售额", "xpath": "", "kind": "currency", "currency_code": "BRL"},
-    {"period": "30天", "field": "30天已售单位", "xpath": "", "kind": "integer"},
-    {"period": "30天", "field": "30天平均单价", "xpath": "", "kind": "currency", "currency_code": "BRL"},
-    {"period": "30天", "field": "30天访问", "xpath": "", "kind": "integer"},
-    {"period": "30天", "field": "30天销售量", "xpath": "", "kind": "integer"},
-    {"period": "30天", "field": "30天转换率", "xpath": "", "kind": "percent"},
-    {"period": "30天", "field": "30天取消的销售数量", "xpath": "", "kind": "integer"},
-    {"period": "30天", "field": "30天取消的销售价值", "xpath": "", "kind": "currency", "currency_code": "BRL"},
-    {"period": "30天", "field": "30天退货数量", "xpath": "", "kind": "integer"},
-    {"period": "30天", "field": "30天退货价值", "xpath": "", "kind": "currency", "currency_code": "BRL"},
-    {"period": "30天", "field": "30天独特的参观", "xpath": "", "kind": "integer"},
-    {"period": "30天", "field": "30天购买意向", "xpath": "", "kind": "integer"},
-    {"period": "30天", "field": "30天独立意向转换率", "xpath": "", "kind": "percent"},
-    {"period": "30天", "field": "30天意向购买转换率", "xpath": "", "kind": "percent"},
+    {"period": "7天", "field": "7天总销售额", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][1]//p[@class="metrics-amount-container__value"]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "7天", "field": "7天已售件数", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][2]//p[@class="metrics-amount-container__value"]', "kind": "integer"},
+    {"period": "7天", "field": "7天平均单价", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][3]//p[@class="metrics-amount-container__value"]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "7天", "field": "7天访问", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][4]//p[@class="metrics-amount-container__value"]', "kind": "integer"},
+    {"period": "7天", "field": "7天销售量", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][5]//p[@class="metrics-amount-container__value"]', "kind": "integer"},
+    {"period": "7天", "field": "7天转换率", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][6]//p[@class="metrics-amount-container__value"]', "kind": "percent"},
+    {"period": "7天", "field": "7天取消的销售数量", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][8]//p[@class="metrics-amount-container__value"]', "kind": "integer"},
+    {"period": "7天", "field": "7天取消的销售价值", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][9]//p[@class="metrics-amount-container__value"]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "7天", "field": "7天退货数量", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][10]//p[@class="metrics-amount-container__value"]', "kind": "integer"},
+    {"period": "7天", "field": "7天退货价值", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][11]//p[@class="metrics-amount-container__value"]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "7天", "field": "7天独特的参观", "xpath": '(//div[contains(@class,"metrics-funnel__series-circles")])[1]//span[contains(@class,"andes-typography--color-primary")]', "kind": "integer"},
+    {"period": "7天", "field": "7天购买意向", "xpath": '(//div[contains(@class,"metrics-funnel__series-circles")])[2]//span[contains(@class,"andes-typography--color-primary")]', "kind": "integer"},
+    {"period": "7天", "field": "7天总转换率", "xpath": '//div[contains(@class,"metrics-funnel__summary-primary")]//span[contains(@class,"andes-typography--color-primary")]', "kind": "percent"},
+    {"period": "7天", "field": "7天独立意向转换率", "xpath": '//div[@id="_r_gj_"]//p[@class="andes-badge__content"]', "kind": "percent"},
+    {"period": "7天", "field": "7天意向购买转换率", "xpath": '//div[@id="_r_gm_"]//p[@class="andes-badge__content"]', "kind": "percent"},
+    {"period": "30天", "field": "30天总销售额", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][1]//p[@class="metrics-amount-container__value"]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "30天", "field": "30天已售件数", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][2]//p[@class="metrics-amount-container__value"]', "kind": "integer"},
+    {"period": "30天", "field": "30天平均单价", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][3]//p[@class="metrics-amount-container__value"]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "30天", "field": "30天访问", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][4]//p[@class="metrics-amount-container__value"]', "kind": "integer"},
+    {"period": "30天", "field": "30天销售量", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][5]//p[@class="metrics-amount-container__value"]', "kind": "integer"},
+    {"period": "30天", "field": "30天转换率", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][6]//p[@class="metrics-amount-container__value"]', "kind": "percent"},
+    {"period": "30天", "field": "30天取消的销售数量", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][8]//p[@class="metrics-amount-container__value"]', "kind": "integer"},
+    {"period": "30天", "field": "30天取消的销售价值", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][9]//p[@class="metrics-amount-container__value"]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "30天", "field": "30天退货数量", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][10]//p[@class="metrics-amount-container__value"]', "kind": "integer"},
+    {"period": "30天", "field": "30天退货价值", "xpath": '//div[@id="performance_summary_amount_expandible-expandable-section-content"]//div[contains(@class,"metrics-amount-container") and contains(@class,"metrics-amount-container--medium") and contains(@class,"metrics-amount-container--button")][11]//p[@class="metrics-amount-container__value"]', "kind": "currency", "currency_code": "BRL"},
+    {"period": "30天", "field": "30天独特的参观", "xpath": '(//div[contains(@class,"metrics-funnel__series-circles")])[1]//span[contains(@class,"andes-typography--color-primary")]', "kind": "integer"},
+    {"period": "30天", "field": "30天购买意向", "xpath": '(//div[contains(@class,"metrics-funnel__series-circles")])[2]//span[contains(@class,"andes-typography--color-primary")]', "kind": "integer"},
+    {"period": "30天", "field": "30天总转换率", "xpath": '//div[contains(@class,"metrics-funnel__summary-primary")]//span[contains(@class,"andes-typography--color-primary")]', "kind": "percent"},
+    {"period": "30天", "field": "30天独立意向转换率", "xpath": '//div[@id="_r_gj_"]//p[@class="andes-badge__content"]', "kind": "percent"},
+    {"period": "30天", "field": "30天意向购买转换率", "xpath": '//div[@id="_r_gm_"]//p[@class="andes-badge__content"]', "kind": "percent"}
 ]
 
 
@@ -92,6 +112,8 @@ class MercadoAuto:
         if not debugging_port:
             raise RuntimeError("紫鸟没有返回 debuggingPort，无法接管美客多店铺")
 
+        LOGGER.info("[美客多][开始] 店铺=%s，准备接管紫鸟浏览器，debugging_port=%s", store_name, debugging_port)
+
         # 连接紫鸟已经打开的 Chromium，不创建普通浏览器，也不调用 tab.get()。
         browser = Chromium(f"127.0.0.1:{debugging_port}")
         tab = browser.latest_tab
@@ -99,18 +121,45 @@ class MercadoAuto:
         feishu_fields: dict[str, Any] = {}
         raw_values: dict[str, str] = {}
 
-        # 先点击进入经营数据页面，再分别读取 7 天和 30 天指标。
-        self._run_click_steps(tab, COMMON_CLICK_STEPS)
+        # 先等待首页文档加载完成，再固定等待 10 秒，让广告弹窗和左侧菜单完成渲染。
+        self._wait_for_page_ready(tab, PAGE_READY_TIMEOUT_SECONDS)
+        LOGGER.info("[美客多][页面] 主文档等待结束，额外等待 %s 秒", AFTER_PAGE_READY_WAIT_SECONDS)
+        time.sleep(AFTER_PAGE_READY_WAIT_SECONDS)
+
+        # 首页广告有时不出现；出现时关闭，并等待“指标”或“销售量”菜单可操作。
+        self._close_home_ad(tab)
+
+        # 指标按钮已可见时直接点击；不可见时先展开销售量菜单，再点击指标。
+        next_after_metrics = (
+            self._first_step_xpath(COMMON_CLICK_STEPS)
+            or self._first_step_xpath(PERIOD_CLICK_STEPS.get("7天", []))
+            or self._first_metric_xpath("7天")
+        )
+        self._enter_metrics_page(tab, next_after_metrics)
+
+        # 预留的其他页面步骤仍可单独填写，之后分别读取 7 天和 30 天指标。
+        next_after_common = self._first_step_xpath(PERIOD_CLICK_STEPS.get("7天", [])) or self._first_metric_xpath("7天")
+        self._run_click_steps(tab, COMMON_CLICK_STEPS, next_after_common)
         for period in ("7天", "30天"):
-            self._run_click_steps(tab, PERIOD_CLICK_STEPS.get(period, []))
+            LOGGER.info("[美客多][指标] 开始切换并采集时间范围=%s", period)
+            self._run_click_steps(tab, PERIOD_CLICK_STEPS.get(period, []), self._first_metric_xpath(period))
             for spec in METRIC_SPECS:
                 if spec["period"] != period:
                     continue
                 field_name = spec["field"]
                 xpath = spec["xpath"]
-                raw_text = self._read_xpath(tab, xpath)
+                raw_text = self._read_xpath(tab, xpath, field_name)
+                converted_value = self._format_value(raw_text, spec["kind"])
                 raw_values[field_name] = raw_text
-                feishu_fields[field_name] = self._format_value(raw_text, spec["kind"])
+                feishu_fields[field_name] = converted_value
+                LOGGER.info(
+                    "[美客多][指标结果] 字段=%s，原始值=%r，转换值=%r，转换后类型=%s，配置类型=%s",
+                    field_name,
+                    raw_text,
+                    converted_value,
+                    type(converted_value).__name__,
+                    spec["kind"],
+                )
 
         # “飞书字段”由 orchestrator 合并进已建立的同名多维表字段。
         # 标准字段仍保留，便于历史电子表和旧版数据表兼容。
@@ -123,38 +172,236 @@ class MercadoAuto:
             "原始数据": json.dumps(raw_values, ensure_ascii=False),
             "飞书字段": feishu_fields,
         }
+        valid_count = sum(value != "" for value in feishu_fields.values())
+        LOGGER.info("[美客多][完成] 店铺=%s，有效指标=%s/%s", store_name, valid_count, len(feishu_fields))
         return [row]
 
-    @staticmethod
-    def _run_click_steps(tab: Any, steps: list[dict[str, Any]]) -> None:
-        """按顺序执行一组点击步骤；空 XPath 或单步失败都不会中断后续采集。"""
-        for step in steps:
+    def _enter_metrics_page(self, tab: Any, next_xpath: str = "") -> bool:
+        """根据“指标”按钮是否可见，选择直接进入或先展开销售量菜单。"""
+        metrics_element = self._find_visible_element(tab, METRICS_BUTTON_XPATH, timeout=2)
+        if metrics_element:
+            LOGGER.info("[美客多][菜单判断] 指标按钮当前可见，直接点击指标")
+        else:
+            LOGGER.info("[美客多][菜单判断] 指标按钮当前不可见，先点击销售量展开按钮")
+            expanded = self._click_with_retry(tab, SALES_SECTION_BUTTON_XPATH, "点击销售量展开按钮")
+            if not expanded:
+                LOGGER.error("[美客多][菜单失败] 销售量展开按钮连续 4 次点击失败，无法正常展开指标菜单")
+                return False
+            if not self._wait_for_xpath(tab, METRICS_BUTTON_XPATH, NEXT_ELEMENT_TIMEOUT_SECONDS, "销售量展开后的指标按钮"):
+                LOGGER.error("[美客多][菜单失败] 展开销售量后等待 30 秒仍未看到指标按钮")
+                return False
+
+        entered = self._click_with_retry(tab, METRICS_BUTTON_XPATH, "点击指标按钮")
+        if not entered:
+            LOGGER.error("[美客多][菜单失败] 指标按钮连续 4 次点击失败，后续指标可能全部为空")
+            return False
+        self._wait_for_xpath(tab, next_xpath, NEXT_ELEMENT_TIMEOUT_SECONDS, "指标页面的下一步骤或首个数据")
+        return True
+
+    def _close_home_ad(self, tab: Any) -> bool:
+        """关闭首页广告弹窗；弹窗未出现时直接继续，不把它当作错误。"""
+        if not self._find_visible_element(tab, HOME_AD_CLOSE_XPATH, timeout=1):
+            LOGGER.info("[美客多][首页广告] 等待 10 秒后未发现广告关闭按钮，直接继续")
+            return False
+        LOGGER.info("[美客多][首页广告] 发现广告弹窗，准备点击关闭，xpath=%s", HOME_AD_CLOSE_XPATH)
+        closed = self._click_with_retry(tab, HOME_AD_CLOSE_XPATH, "关闭首页广告弹窗")
+        if closed:
+            self._wait_for_any_xpath(
+                tab,
+                (
+                    ("指标按钮", METRICS_BUTTON_XPATH),
+                    ("销售量展开按钮", SALES_SECTION_BUTTON_XPATH),
+                ),
+                NEXT_ELEMENT_TIMEOUT_SECONDS,
+                "广告关闭后的菜单按钮",
+            )
+        return closed
+
+    def _run_click_steps(self, tab: Any, steps: list[dict[str, Any]], final_next_xpath: str = "") -> None:
+        """按顺序点击按钮；每个按钮均重试 3 次，并等待下一元素最多 30 秒。"""
+        for index, step in enumerate(steps):
+            step_name = str(step.get("name") or f"第 {index + 1} 个未命名按钮")
             xpath = str(step.get("xpath") or "").strip()
             if not xpath:
                 # 尚未知道实际 XPath 时，保留步骤但安全跳过。
-                continue
-            try:
-                element = tab.ele(f"xpath:{xpath}", timeout=3)
-                if element:
-                    element.click()
-                    wait_seconds = float(step.get("wait_seconds", 1) or 0)
-                    if wait_seconds > 0:
-                        time.sleep(wait_seconds)
-            except Exception:
-                # 某个按钮暂时不存在时，继续尝试后面的步骤和指标。
+                LOGGER.info("[美客多][按钮跳过] 步骤=%s，原因=XPath 为空", step_name)
                 continue
 
+            if not self._click_with_retry(tab, xpath, step_name):
+                LOGGER.error("[美客多][按钮失败] 步骤=%s，全部 4 次点击均失败，继续后续流程", step_name)
+                continue
+
+            wait_seconds = float(step.get("wait_seconds", 1) or 0)
+            if wait_seconds > 0:
+                LOGGER.info("[美客多][按钮] 步骤=%s 点击成功，先等待 %.1f 秒", step_name, wait_seconds)
+                time.sleep(wait_seconds)
+
+            next_xpath = self._next_step_xpath(steps, index + 1) or final_next_xpath
+            self._wait_for_xpath(tab, next_xpath, NEXT_ELEMENT_TIMEOUT_SECONDS, f"{step_name} 后的下一步骤或数据")
+
+    def _click_with_retry(self, tab: Any, xpath: str, step_name: str) -> bool:
+        """首次点击失败后最多重试 3 次，相邻点击尝试至少间隔 2 秒。"""
+        max_attempts = CLICK_RETRY_TIMES + 1
+        for attempt in range(max_attempts):
+            if attempt > 0:
+                interval = CLICK_RETRY_INTERVAL_SECONDS + random.uniform(0, 1)
+                LOGGER.warning(
+                    "[美客多][按钮重试] 步骤=%s，第 %s/%s 次尝试前等待 %.2f 秒，xpath=%s",
+                    step_name,
+                    attempt + 1,
+                    max_attempts,
+                    interval,
+                    xpath,
+                )
+                time.sleep(interval)
+            try:
+                LOGGER.info(
+                    "[美客多][按钮查找] 步骤=%s，第 %s/%s 次尝试，xpath=%s",
+                    step_name,
+                    attempt + 1,
+                    max_attempts,
+                    xpath,
+                )
+                element = self._find_visible_element(tab, xpath, timeout=5)
+                if not element:
+                    LOGGER.warning("[美客多][按钮未找到] 步骤=%s，第 %s/%s 次未找到可见元素", step_name, attempt + 1, max_attempts)
+                    continue
+                element.click()
+                LOGGER.info("[美客多][按钮成功] 步骤=%s，第 %s/%s 次点击成功", step_name, attempt + 1, max_attempts)
+                return True
+            except Exception as exc:
+                LOGGER.warning(
+                    "[美客多][按钮异常] 步骤=%s，第 %s/%s 次失败，异常=%s，xpath=%s",
+                    step_name,
+                    attempt + 1,
+                    max_attempts,
+                    exc,
+                    xpath,
+                )
+        LOGGER.error("[美客多][按钮终止] 步骤=%s，全部 %s 次点击均失败，xpath=%s", step_name, max_attempts, xpath)
+        return False
+
+    def _wait_for_page_ready(self, tab: Any, timeout_seconds: float) -> bool:
+        """轮询 document.readyState，最长等待 60 秒让首页文档加载完成。"""
+        started_at = time.monotonic()
+        deadline = started_at + timeout_seconds
+        last_state = ""
+        LOGGER.info("[美客多][页面等待] 等待 document.readyState=complete，最长 %.1f 秒", timeout_seconds)
+        while time.monotonic() < deadline:
+            try:
+                state = str(tab.run_js("return document.readyState;") or "").lower()
+                if state != last_state:
+                    LOGGER.info("[美客多][页面状态] document.readyState=%s", state)
+                    last_state = state
+                if state == "complete":
+                    LOGGER.info("[美客多][页面成功] 首页文档加载完成，耗时 %.2f 秒", time.monotonic() - started_at)
+                    return True
+            except Exception as exc:
+                LOGGER.warning("[美客多][页面异常] 读取 document.readyState 失败：%s", exc)
+            time.sleep(1)
+        LOGGER.error("[美客多][页面超时] 等待 %.1f 秒仍未加载完成，继续执行", timeout_seconds)
+        return False
+
+    def _wait_for_xpath(self, tab: Any, xpath: str, timeout_seconds: float, target_name: str) -> bool:
+        """等待指定的下一按钮或数据；未配置 XPath 时固定等待完整 30 秒。"""
+        if not xpath:
+            LOGGER.warning("[美客多][元素等待] 目标=%s 未配置 XPath，固定等待 %.1f 秒", target_name, timeout_seconds)
+            time.sleep(timeout_seconds)
+            return True
+        started_at = time.monotonic()
+        deadline = started_at + timeout_seconds
+        LOGGER.info("[美客多][元素等待] 目标=%s，最长等待 %.1f 秒，xpath=%s", target_name, timeout_seconds, xpath)
+        while time.monotonic() < deadline:
+            if self._find_visible_element(tab, xpath, timeout=1):
+                LOGGER.info("[美客多][元素出现] 目标=%s，耗时 %.2f 秒", target_name, time.monotonic() - started_at)
+                return True
+            time.sleep(1)
+        LOGGER.error("[美客多][元素超时] 目标=%s，等待 %.1f 秒仍未出现，xpath=%s", target_name, timeout_seconds, xpath)
+        return False
+
+    def _wait_for_any_xpath(
+        self,
+        tab: Any,
+        targets: tuple[tuple[str, str], ...],
+        timeout_seconds: float,
+        target_group_name: str,
+    ) -> str:
+        """等待多个候选元素中的任意一个出现，返回实际出现元素的名称。"""
+        started_at = time.monotonic()
+        deadline = started_at + timeout_seconds
+        LOGGER.info("[美客多][元素等待] 目标=%s，最长等待 %.1f 秒", target_group_name, timeout_seconds)
+        while time.monotonic() < deadline:
+            for target_name, xpath in targets:
+                if xpath and self._find_visible_element(tab, xpath, timeout=0.5):
+                    LOGGER.info("[美客多][元素出现] 目标=%s，实际出现=%s，耗时 %.2f 秒", target_group_name, target_name, time.monotonic() - started_at)
+                    return target_name
+            time.sleep(1)
+        LOGGER.error("[美客多][元素超时] 目标=%s，等待 %.1f 秒仍无候选元素出现", target_group_name, timeout_seconds)
+        return ""
+
     @staticmethod
-    def _read_xpath(tab: Any, xpath: str) -> str:
+    def _find_visible_element(tab: Any, xpath: str, timeout: float = 1) -> Any:
+        """查找 XPath 元素，并兼容 DrissionPage 不同版本的可见性属性。"""
+        if not xpath:
+            return None
+        try:
+            element = tab.ele(f"xpath:{xpath}", timeout=timeout)
+            if not element:
+                return None
+            states = getattr(element, "states", None)
+            displayed = getattr(states, "is_displayed", None) if states is not None else None
+            if callable(displayed):
+                displayed = displayed()
+            if displayed is not None:
+                return element if bool(displayed) else None
+            legacy_displayed = getattr(element, "is_displayed", None)
+            if callable(legacy_displayed):
+                return element if bool(legacy_displayed()) else None
+            if legacy_displayed is not None:
+                return element if bool(legacy_displayed) else None
+            # 无可见性属性时按已找到处理，兼容简单的 DrissionPage 元素对象和测试对象。
+            return element
+        except Exception:
+            return None
+
+    @staticmethod
+    def _next_step_xpath(steps: list[dict[str, Any]], start_index: int) -> str:
+        """从后续按钮步骤中返回第一个非空 XPath。"""
+        for step in steps[start_index:]:
+            xpath = str(step.get("xpath") or "").strip()
+            if xpath:
+                return xpath
+        return ""
+
+    @staticmethod
+    def _first_step_xpath(steps: list[dict[str, Any]]) -> str:
+        """返回一组按钮步骤中的第一个非空 XPath。"""
+        return MercadoAuto._next_step_xpath(steps, 0)
+
+    @staticmethod
+    def _first_metric_xpath(period: str) -> str:
+        """返回指定时间范围的第一个非空指标 XPath，供按钮点击后等待数据。"""
+        for spec in METRIC_SPECS:
+            if spec["period"] == period and spec.get("xpath"):
+                return spec["xpath"]
+        return ""
+
+    @staticmethod
+    def _read_xpath(tab: Any, xpath: str, field_name: str = "未命名指标") -> str:
         """读取一个 XPath 文本；XPath 为空、元素不存在或异常时返回空字符串。"""
         if not xpath:
+            LOGGER.warning("[美客多][指标跳过] 字段=%s，原因=XPath 为空", field_name)
             return ""
         try:
             element = tab.ele(f"xpath:{xpath}", timeout=3)
             if not element:
+                LOGGER.warning("[美客多][指标未找到] 字段=%s，xpath=%s", field_name, xpath)
                 return ""
-            return str(element.text or "").strip()
-        except Exception:
+            raw_text = str(element.text or "").strip()
+            LOGGER.info("[美客多][指标抓取] 字段=%s，原始文本=%r，xpath=%s", field_name, raw_text, xpath)
+            return raw_text
+        except Exception as exc:
+            LOGGER.warning("[美客多][指标异常] 字段=%s，异常=%s，xpath=%s", field_name, exc, xpath)
             return ""
 
     @staticmethod
