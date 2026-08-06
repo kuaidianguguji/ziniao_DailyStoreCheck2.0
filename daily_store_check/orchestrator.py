@@ -234,7 +234,7 @@ class DailyStoreCheck:
         task: StoreTask,
         rows: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], list[list[Any]]]:
-        """为 Shopee 和 Mercado 保留原有通用字段打包方式。"""
+        """为尚未提供专用飞书字段结构的平台（当前为 Shopee）打包通用字段。"""
         bitable = self.config.get("feishu", {}).get("bitable", {})
         fields = bitable.get("data_fields", {})
         now = datetime.now(timezone.utc).isoformat()
