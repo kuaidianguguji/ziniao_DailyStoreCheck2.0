@@ -39,17 +39,51 @@ CLICK_RETRY_INTERVAL_SECONDS = 2
 NEXT_ELEMENT_TIMEOUT_SECONDS = 30
 
 
+# 日期切换按钮及两个快捷日期选项。日期选项使用稳定的 id 片段定位。
+DATE_SWITCH_BUTTON_XPATH = '(//button[@class="andes-dropdown__trigger"])[1]'
+LAST_7_DAYS_OPTION_XPATH = '//li[contains(@id, "option-lastSevenDays")]'
+LAST_30_DAYS_OPTION_XPATH = '//li[contains(@id, "option-lastMonth")]'
+
+
 # 统计页面中的时间范围切换步骤。
-# 日期控件的动态 id 中包含 r_1c，使用 contains() 避免每次页面生成的后缀变化。
-# 每个时间范围都必须先打开日期菜单，再点击对应的快捷选项。
+# success_state="visible"：目标出现后才算当前按钮点击成功。
+# success_state="hidden"：目标连续两次不可见后才算当前按钮点击成功。
 PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
     "7天": [
-        {"name": "打开日期切换按钮（7天）", "xpath": '(//button[@class="andes-dropdown__trigger"])[1]', "wait_seconds": 1},
-        {"name": "选择最近7天", "xpath": '//li[contains(@id, "option-lastSevenDays")]', "wait_seconds": 2},
+        {
+            "name": "打开日期切换按钮（7天）",
+            "xpath": DATE_SWITCH_BUTTON_XPATH,
+            "wait_seconds": 1,
+            "success_xpath": LAST_7_DAYS_OPTION_XPATH,
+            "success_state": "visible",
+            "success_name": "最近7天选项出现",
+        },
+        {
+            "name": "选择最近7天",
+            "xpath": LAST_7_DAYS_OPTION_XPATH,
+            "wait_seconds": 2,
+            "success_xpath": LAST_7_DAYS_OPTION_XPATH,
+            "success_state": "hidden",
+            "success_name": "最近7天选项消失",
+        },
     ],
     "30天": [
-        {"name": "打开日期切换按钮（30天）", "xpath": '(//button[@class="andes-dropdown__trigger"])[1]', "wait_seconds": 1},
-        {"name": "选择最近30天", "xpath": '//li[contains(@id, "option-lastMonth")]', "wait_seconds": 2},
+        {
+            "name": "打开日期切换按钮（30天）",
+            "xpath": DATE_SWITCH_BUTTON_XPATH,
+            "wait_seconds": 1,
+            "success_xpath": LAST_30_DAYS_OPTION_XPATH,
+            "success_state": "visible",
+            "success_name": "最近30天选项出现",
+        },
+        {
+            "name": "选择最近30天",
+            "xpath": LAST_30_DAYS_OPTION_XPATH,
+            "wait_seconds": 2,
+            "success_xpath": LAST_30_DAYS_OPTION_XPATH,
+            "success_state": "hidden",
+            "success_name": "最近30天选项消失",
+        },
     ],
 }
 
@@ -239,7 +273,17 @@ class MercadoAuto:
                 LOGGER.info("[美客多][按钮跳过] 步骤=%s，原因=XPath 为空", step_name)
                 continue
 
-            if not self._click_with_retry(tab, xpath, step_name):
+            success_xpath = str(step.get("success_xpath") or "").strip()
+            success_state = str(step.get("success_state") or "").strip().lower()
+            success_name = str(step.get("success_name") or "点击后的页面状态")
+            if not self._click_with_retry(
+                tab,
+                xpath,
+                step_name,
+                success_xpath=success_xpath,
+                success_state=success_state,
+                success_name=success_name,
+            ):
                 LOGGER.error("[美客多][按钮失败] 步骤=%s，全部 4 次点击均失败，继续后续流程", step_name)
                 continue
 
@@ -251,10 +295,27 @@ class MercadoAuto:
             next_xpath = self._next_step_xpath(steps, index + 1) or final_next_xpath
             self._wait_for_xpath(tab, next_xpath, NEXT_ELEMENT_TIMEOUT_SECONDS, f"{step_name} 后的下一步骤或数据")
 
-    def _click_with_retry(self, tab: Any, xpath: str, step_name: str) -> bool:
-        """首次点击失败后最多重试 3 次，相邻点击尝试至少间隔 2 秒。"""
+    def _click_with_retry(
+        self,
+        tab: Any,
+        xpath: str,
+        step_name: str,
+        success_xpath: str = "",
+        success_state: str = "",
+        success_name: str = "点击后的页面状态",
+    ) -> bool:
+        """点击并验证页面状态；验证失败也会进入最多 3 次的重试流程。"""
         max_attempts = CLICK_RETRY_TIMES + 1
         for attempt in range(max_attempts):
+            # 日期菜单可能在上一次点击后延迟完成变化；重试前先检查目标状态，
+            # 避免已经成功却再次点击，从而把刚打开的菜单重新关闭。
+            if success_xpath and success_state == "visible" and self._element_state_matches(tab, success_xpath, success_state):
+                LOGGER.info("[美客多][按钮验证成功] 步骤=%s，%s，无需再次点击", step_name, success_name)
+                return True
+            if attempt > 0 and success_xpath and success_state == "hidden" and self._element_state_matches(tab, success_xpath, success_state):
+                LOGGER.info("[美客多][按钮验证成功] 步骤=%s，%s，在重试前确认上次点击已生效", step_name, success_name)
+                return True
+
             if attempt > 0:
                 interval = CLICK_RETRY_INTERVAL_SECONDS + random.uniform(0, 1)
                 LOGGER.warning(
@@ -279,7 +340,27 @@ class MercadoAuto:
                     LOGGER.warning("[美客多][按钮未找到] 步骤=%s，第 %s/%s 次未找到可见元素", step_name, attempt + 1, max_attempts)
                     continue
                 element.click()
-                LOGGER.info("[美客多][按钮成功] 步骤=%s，第 %s/%s 次点击成功", step_name, attempt + 1, max_attempts)
+                if success_xpath and success_state:
+                    LOGGER.info("[美客多][按钮已点击] 步骤=%s，第 %s/%s 次已发送点击，开始验证页面状态", step_name, attempt + 1, max_attempts)
+                    verified = self._wait_for_element_state(
+                        tab,
+                        success_xpath,
+                        success_state,
+                        NEXT_ELEMENT_TIMEOUT_SECONDS,
+                        success_name,
+                    )
+                    if not verified:
+                        LOGGER.warning(
+                            "[美客多][按钮验证失败] 步骤=%s，第 %s/%s 次点击后未满足条件=%s，准备重试",
+                            step_name,
+                            attempt + 1,
+                            max_attempts,
+                            success_name,
+                        )
+                        continue
+                else:
+                    LOGGER.info("[美客多][按钮已点击] 步骤=%s，第 %s/%s 次已发送点击，无额外状态验证", step_name, attempt + 1, max_attempts)
+                LOGGER.info("[美客多][按钮成功] 步骤=%s，第 %s/%s 次点击并验证成功", step_name, attempt + 1, max_attempts)
                 return True
             except Exception as exc:
                 LOGGER.warning(
@@ -291,6 +372,62 @@ class MercadoAuto:
                     xpath,
                 )
         LOGGER.error("[美客多][按钮终止] 步骤=%s，全部 %s 次点击均失败，xpath=%s", step_name, max_attempts, xpath)
+        return False
+
+    def _wait_for_element_state(
+        self,
+        tab: Any,
+        xpath: str,
+        expected_state: str,
+        timeout_seconds: float,
+        target_name: str,
+    ) -> bool:
+        """等待元素出现或消失；消失需连续确认两次，避免瞬时查找异常造成误判。"""
+        if expected_state not in {"visible", "hidden"}:
+            LOGGER.error("[美客多][状态配置错误] 目标=%s，不支持的 expected_state=%s", target_name, expected_state)
+            return False
+
+        started_at = time.monotonic()
+        deadline = started_at + timeout_seconds
+        hidden_checks = 0
+        LOGGER.info(
+            "[美客多][状态等待] 目标=%s，期望状态=%s，最长等待 %.1f 秒，xpath=%s",
+            target_name,
+            expected_state,
+            timeout_seconds,
+            xpath,
+        )
+        while time.monotonic() < deadline:
+            visible = bool(self._find_visible_element(tab, xpath, timeout=1))
+            if expected_state == "visible" and visible:
+                LOGGER.info("[美客多][状态满足] 目标=%s 已出现，耗时 %.2f 秒", target_name, time.monotonic() - started_at)
+                return True
+            if expected_state == "hidden":
+                if visible:
+                    hidden_checks = 0
+                else:
+                    hidden_checks += 1
+                    if hidden_checks >= 2:
+                        LOGGER.info("[美客多][状态满足] 目标=%s 已连续两次不可见，确认消失，耗时 %.2f 秒", target_name, time.monotonic() - started_at)
+                        return True
+            time.sleep(0.5)
+
+        LOGGER.error(
+            "[美客多][状态超时] 目标=%s，等待 %.1f 秒仍未达到状态=%s，xpath=%s",
+            target_name,
+            timeout_seconds,
+            expected_state,
+            xpath,
+        )
+        return False
+
+    def _element_state_matches(self, tab: Any, xpath: str, expected_state: str) -> bool:
+        """立即检查元素当前状态，用于重试前确认上一次点击是否已经延迟生效。"""
+        visible = bool(self._find_visible_element(tab, xpath, timeout=0.5))
+        if expected_state == "visible":
+            return visible
+        if expected_state == "hidden":
+            return not visible
         return False
 
     def _wait_for_page_ready(self, tab: Any, timeout_seconds: float) -> bool:
