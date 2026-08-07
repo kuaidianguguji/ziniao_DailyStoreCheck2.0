@@ -11,6 +11,7 @@ import logging
 import os
 import platform
 import subprocess
+import threading
 import time
 import traceback
 import uuid
@@ -42,8 +43,11 @@ class ZiniaoClient:
         self.driver_folder = Path(browser.get("webdriver_path", "")) if browser.get("webdriver_path") else None
         self.socket_port = int(browser.get("socket_port", 16851))
         self.version = str(browser.get("version", "v6"))
+        # 店铺执行期间定期发送合法的只读请求，防止部分 V6 客户端的 WebDriver IPC 长时间空闲后退出。
+        self.ipc_keepalive_seconds = max(15, int(browser.get("ipc_keepalive_seconds", 60)))
         self.user_info = {"company": user.get("company", ""), "username": user.get("username", ""), "password": user.get("password", "")}
         self.system = platform.system()
+        self._client_process: subprocess.Popen[Any] | None = None
 
     @property
     def ipc_url(self) -> str:
@@ -56,8 +60,15 @@ class ZiniaoClient:
         response.raise_for_status()
         return json.loads(response.text)
 
-    def _probe_ipc(self, timeout_seconds: float = 2) -> bool:
-        """用只读 getBrowserList 检查紫鸟 WebDriver IPC 是否正在监听。"""
+    def _probe_ipc(self, timeout_seconds: float = 15) -> bool:
+        """用合法 HTTP 请求检查紫鸟 WebDriver IPC 是否已经可用。
+
+        紫鸟没有提供独立的健康检查接口，因此沿用官方的
+        ``getBrowserList``。这个接口首次执行时会完成登录、读取店铺列表和
+        工作台握手，实际耗时可能超过 2 秒，所以探活必须给予足够时间。
+        不能只建立 TCP 后立即断开：部分紫鸟 V6 版本会把这种空连接视为
+        异常请求，影响本地 HTTP 服务稳定性。
+        """
         try:
             payload = {"action": "getBrowserList", "requestId": str(uuid.uuid4()), **self.user_info}
             response = requests.post(
@@ -65,12 +76,20 @@ class ZiniaoClient:
                 json.dumps(payload).encode("utf-8"),
                 timeout=timeout_seconds,
             )
-            return response.ok
-        except requests.RequestException:
+            result = json.loads(response.text)
+            # 即使 statusCode 是登录错误，能够收到紫鸟标准 JSON 也说明 IPC
+            # 已经启动；具体业务错误交给 update_core/list_browsers 清晰报告。
+            return isinstance(result, dict) and result.get("statusCode") is not None
+        except (requests.RequestException, json.JSONDecodeError, TypeError, ValueError):
             return False
 
     def start_client(self) -> None:
-        """启动紫鸟客户端；已启动时不重复启动。"""
+        """按官方演示启动紫鸟客户端；已启动时不重复启动。
+
+        官方示例启动后固定等待 5 秒，再由 ``update_core`` 循环请求确认
+        IPC 和内核状态。启动阶段不再额外调用 ``getBrowserList``，避免在
+        紫鸟工作台握手尚未完成时重复触发列表读取。
+        """
         if self._probe_ipc():
             LOGGER.info("紫鸟客户端已经在端口 %s 运行，直接复用", self.socket_port)
             return
@@ -85,32 +104,124 @@ class ZiniaoClient:
         else:
             raise RuntimeError(f"不支持的操作系统: {self.system}")
         try:
-            subprocess.Popen(command)
+            self._client_process = subprocess.Popen(command)
         except OSError as exc:
             raise RuntimeError(f"启动紫鸟客户端失败: {exc}") from exc
 
-        # 不再固定等待 5 秒；只有 IPC 真实可用后才能继续调用 updateCore/startBrowser/stopBrowser。
-        for waited_seconds in range(1, 31):
-            time.sleep(1)
-            if self._probe_ipc():
-                LOGGER.info("紫鸟 WebDriver IPC 启动成功，端口=%s，等待=%s秒", self.socket_port, waited_seconds)
-                return
-        raise TimeoutError(f"紫鸟客户端已启动，但 30 秒内 IPC 端口 {self.socket_port} 未就绪")
+        # 与官方 ziniao_webdriver_demo.py 保持一致：启动客户端后等待 5 秒。
+        # 后续 update_core() 会在 IPC 暂时不可用时按官方方式循环重试，
+        # 因此这里不主动发送任何业务请求，也不产生第二个客户端进程。
+        time.sleep(5)
+        LOGGER.info(
+            "紫鸟 WebDriver 客户端启动命令已执行，已按官方流程等待 5 秒，端口=%s，启动进程PID=%s",
+            self.socket_port,
+            self._client_process.pid if self._client_process else "未知",
+        )
+
+    def recover_ipc(self, timeout_seconds: float = 30) -> bool:
+        """IPC 失联后重新启动客户端，并确认官方 updateCore 已经可以正常执行。"""
+        if self._probe_ipc(timeout_seconds=3):
+            LOGGER.info("[紫鸟][IPC恢复] 端口=%s 已经可用，继续验证 updateCore", self.socket_port)
+            try:
+                self.update_core()
+                return True
+            except Exception:
+                LOGGER.error("[紫鸟][IPC恢复] 端口可连接但 updateCore 失败: %s", traceback.format_exc())
+                return False
+
+        try:
+            self.start_client()
+        except Exception:
+            LOGGER.error("[紫鸟][IPC恢复] 启动客户端失败: %s", traceback.format_exc())
+            return False
+
+        started_at = time.monotonic()
+        deadline = started_at + timeout_seconds
+        check_count = 0
+        while time.monotonic() < deadline:
+            check_count += 1
+            if self._probe_ipc(timeout_seconds=3):
+                try:
+                    self.update_core()
+                    LOGGER.info(
+                        "[紫鸟][IPC恢复成功] 端口=%s，第 %s 次检查及 updateCore 均成功，耗时=%.2f秒",
+                        self.socket_port,
+                        check_count,
+                        time.monotonic() - started_at,
+                    )
+                    return True
+                except Exception:
+                    LOGGER.error("[紫鸟][IPC恢复] IPC 已出现但 updateCore 失败: %s", traceback.format_exc())
+                    return False
+            LOGGER.warning("[紫鸟][IPC恢复等待] 端口=%s，第 %s 次检查仍不可用", self.socket_port, check_count)
+            time.sleep(2)
+
+        LOGGER.error("[紫鸟][IPC恢复超时] 等待 %.1f 秒后端口 %s 仍不可用", timeout_seconds, self.socket_port)
+        return False
+
+    def ipc_keepalive(self) -> bool:
+        """发送只读 getBrowserList 请求，为长时间爬虫任务维持并检查 IPC。"""
+        return self._probe_ipc(timeout_seconds=10)
+
+    @staticmethod
+    def _browser_debug_endpoint_alive(debugging_port: int | str | None, timeout_seconds: float = 2) -> bool:
+        """通过 Chromium 调试接口判断对应店铺浏览器进程是否仍然存活。"""
+        if not debugging_port:
+            return False
+        try:
+            response = requests.get(f"http://127.0.0.1:{int(debugging_port)}/json/version", timeout=timeout_seconds)
+            return response.ok and bool(response.text.strip())
+        except (requests.RequestException, TypeError, ValueError):
+            return False
+
+    def confirm_browser_closed(
+        self,
+        debugging_port: int | str | None,
+        checks: int = 3,
+        interval_seconds: float = 1,
+    ) -> bool:
+        """连续检查调试端口；只有三次均不可用，才确认店铺浏览器已经关闭。"""
+        if not debugging_port:
+            LOGGER.warning("[紫鸟][浏览器关闭确认跳过] startBrowser 未返回 debuggingPort，不能通过端口确认")
+            return False
+
+        for check_index in range(1, checks + 1):
+            if self._browser_debug_endpoint_alive(debugging_port):
+                LOGGER.warning(
+                    "[紫鸟][浏览器仍存活] debuggingPort=%s，第 %s/%s 次检查仍可访问",
+                    debugging_port,
+                    check_index,
+                    checks,
+                )
+                return False
+            LOGGER.info(
+                "[紫鸟][浏览器关闭检查] debuggingPort=%s，第 %s/%s 次检查不可用",
+                debugging_port,
+                check_index,
+                checks,
+            )
+            if check_index < checks:
+                time.sleep(interval_seconds)
+        LOGGER.info("[紫鸟][浏览器关闭确认成功] debuggingPort=%s 连续 %s 次不可用", debugging_port, checks)
+        return True
 
     def update_core(self) -> None:
         """等待紫鸟内核更新完成。"""
         payload = {"action": "updateCore", "requestId": str(uuid.uuid4()), **self.user_info}
-        for _ in range(60):
+        for attempt in range(1, 61):
             try:
                 result = self.send_http(payload)
-            except requests.RequestException:
+            except requests.RequestException as exc:
+                LOGGER.warning("[紫鸟][updateCore] IPC 暂不可用，第 %s/60 次，异常=%s", attempt, exc)
                 time.sleep(2)
                 continue
             code = result.get("statusCode")
             if code == 0:
+                LOGGER.info("[紫鸟][updateCore] 内核更新完成，第 %s 次请求成功", attempt)
                 return
             if code == -10003:
                 raise RuntimeError(f"紫鸟登录或版本不支持: {result}")
+            LOGGER.info("[紫鸟][updateCore] 尚未完成，第 %s/60 次，statusCode=%s", attempt, code)
             time.sleep(2)
         raise TimeoutError("等待紫鸟内核更新超时")
 
@@ -119,7 +230,9 @@ class ZiniaoClient:
         result = self.send_http({"action": "getBrowserList", "requestId": str(uuid.uuid4()), **self.user_info})
         if str(result.get("statusCode")) != "0":
             raise RuntimeError(f"读取紫鸟店铺失败: {result}")
-        return result.get("browserList", [])
+        browser_list = result.get("browserList", [])
+        LOGGER.info("[紫鸟][getBrowserList] 店铺列表读取成功，店铺数=%s", len(browser_list))
+        return browser_list
 
     def open_store(
         self,
@@ -155,14 +268,15 @@ class ZiniaoClient:
             payload["injectJsInfo"] = json.dumps(jsInfo)
         result = self.send_http(payload)
         status_code = str(result.get("statusCode"))
+        LOGGER.info("[紫鸟][startBrowser] 店铺标识=%s，返回 statusCode=%s", store_info, status_code)
         if status_code == "0":
             return result
         if status_code == "-10003":
             raise RuntimeError(f"紫鸟登录失败或当前版本不支持 startBrowser: {json.dumps(result, ensure_ascii=False)}")
         raise RuntimeError(f"紫鸟 startBrowser 打开店铺失败: {json.dumps(result, ensure_ascii=False)}")
 
-    def close_store(self, browser_oauth: str) -> None:
-        """关闭当前店铺；IPC 端口失联时重启紫鸟客户端并重试。"""
+    def close_store(self, browser_oauth: str, debugging_port: int | str | None = None) -> None:
+        """优先用官方 stopBrowser 关闭；IPC 失联时结合调试端口确认并恢复。"""
         last_error: Exception | None = None
         for attempt in range(3):
             if attempt > 0:
@@ -187,13 +301,22 @@ class ZiniaoClient:
             except requests.RequestException as exc:
                 last_error = exc
                 LOGGER.warning("紫鸟 IPC 连接失败，第 %s/3 次，url=%s，异常=%s", attempt + 1, self.ipc_url, exc)
+
+                # IPC 可能随店铺浏览器一起退出。只有调试端口连续三次不可用，才把它视为“浏览器已经关闭”。
+                if self.confirm_browser_closed(debugging_port):
+                    if self.recover_ipc():
+                        LOGGER.warning(
+                            "[紫鸟][关闭兜底成功] stopBrowser 请求前 IPC 已失联，但 debuggingPort=%s 已确认关闭且 IPC 已恢复",
+                            debugging_port,
+                        )
+                        return
+                    last_error = RuntimeError("店铺浏览器已关闭，但紫鸟 IPC 恢复失败，不能继续打开下一店铺")
+                    break
+
                 if attempt == 0:
-                    try:
-                        LOGGER.warning("紫鸟 IPC 已失联，尝试重新启动 WebDriver 客户端后继续关闭店铺")
-                        self.start_client()
-                    except Exception as restart_error:
-                        last_error = restart_error
-                        LOGGER.error("重新启动紫鸟 WebDriver 客户端失败: %s", traceback.format_exc())
+                    LOGGER.warning("紫鸟 IPC 已失联，店铺浏览器仍存活；尝试恢复 IPC 后继续发送 stopBrowser")
+                    if not self.recover_ipc():
+                        LOGGER.error("重新启动紫鸟 WebDriver 客户端失败，将继续后续关闭重试")
 
         raise ZiniaoStoreCloseError(f"紫鸟店铺连续 3 次关闭失败，browserOauth={browser_oauth}: {last_error}") from last_error
 
@@ -240,11 +363,15 @@ class ZiniaoClient:
 
     def exit_client(self) -> None:
         """任务全部结束后通知紫鸟客户端退出。"""
-        if not self._probe_ipc(timeout_seconds=1):
-            LOGGER.info("紫鸟 IPC 端口 %s 已不可用，视为客户端已退出，不再发送 exit", self.socket_port)
-            return
         try:
+            # 官方示例在任务结束后直接发送 exit。这里不再先调用
+            # getBrowserList 探活，避免退出阶段额外触发登录或列表读取。
             self.send_http({"action": "exit", "requestId": str(uuid.uuid4()), **self.user_info})
+            LOGGER.info("紫鸟客户端 exit 请求发送成功")
+        except requests.RequestException as exc:
+            # IPC 已经随店铺浏览器退出时，连接被拒绝等同于客户端已关闭，
+            # 无需输出整段 urllib3 堆栈干扰排错。
+            LOGGER.info("紫鸟 IPC 已不可用，客户端无需重复退出: %s", exc)
         except Exception:
             LOGGER.warning("退出紫鸟客户端时发生异常: %s", traceback.format_exc())
 
@@ -260,6 +387,8 @@ class ZiniaoStoreSession:
         self.opened: dict[str, Any] = {}
         self.driver: webdriver.Chrome | None = None
         self.browser_oauth = identifier
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
 
     def __enter__(self) -> "ZiniaoStoreSession":
         LOGGER.info("打开店铺: %s", self.store_name)
@@ -274,11 +403,12 @@ class ZiniaoStoreSession:
             if not self.client.open_ip_check(self.driver, ip_check_url):
                 raise RuntimeError("紫鸟 IP 检测未通过")
             self.client.open_launcher_page(self.driver, str(self.opened.get("launcherPage") or ""))
+            self._start_ipc_heartbeat()
             return self
         except Exception:
             # __enter__ 内抛错时 Python 不会调用 __exit__，这里必须主动关闭店铺。
             try:
-                self.client.close_store(self.browser_oauth)
+                self.client.close_store(self.browser_oauth, self.opened.get("debuggingPort"))
             except Exception:
                 LOGGER.error("初始化 driver 失败后关闭店铺 %s 也失败: %s", self.store_name, traceback.format_exc())
             raise
@@ -288,15 +418,67 @@ class ZiniaoStoreSession:
         """返回紫鸟为当前店铺分配的下载目录。"""
         return str(self.opened.get("downloadPath") or "")
 
+    def _start_ipc_heartbeat(self) -> None:
+        """启动单店铺 IPC 心跳，爬虫长时间运行时每隔固定时间检查一次。"""
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            return
+        self._heartbeat_stop.clear()
+
+        def heartbeat_loop() -> None:
+            heartbeat_index = 0
+            while not self._heartbeat_stop.wait(self.client.ipc_keepalive_seconds):
+                heartbeat_index += 1
+                if self.client.ipc_keepalive():
+                    LOGGER.info(
+                        "[紫鸟][IPC心跳成功] 店铺=%s，第 %s 次，间隔=%s秒",
+                        self.store_name,
+                        heartbeat_index,
+                        self.client.ipc_keepalive_seconds,
+                    )
+                else:
+                    # 爬虫过程中不强行重启客户端，避免影响仍在运行的店铺浏览器；退出会话时再执行关闭兜底。
+                    LOGGER.error(
+                        "[紫鸟][IPC心跳失败] 店铺=%s，第 %s 次；浏览器继续采集，结束时将执行端口确认和 IPC 恢复",
+                        self.store_name,
+                        heartbeat_index,
+                    )
+
+        self._heartbeat_thread = threading.Thread(
+            target=heartbeat_loop,
+            name=f"ziniao-ipc-heartbeat-{self.store_name}",
+            daemon=True,
+        )
+        self._heartbeat_thread.start()
+        LOGGER.info(
+            "[紫鸟][IPC心跳启动] 店铺=%s，间隔=%s秒",
+            self.store_name,
+            self.client.ipc_keepalive_seconds,
+        )
+
+    def _stop_ipc_heartbeat(self) -> None:
+        """关闭前停止心跳，避免心跳请求与 stopBrowser 同时访问 IPC。"""
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
+            self._heartbeat_thread.join(timeout=12)
+        if self._heartbeat_thread:
+            LOGGER.info(
+                "[紫鸟][IPC心跳停止] 店铺=%s，线程是否仍存活=%s",
+                self.store_name,
+                self._heartbeat_thread.is_alive(),
+            )
+
     def __exit__(self, exc_type, exc_value, traceback_value) -> bool:
         """无论爬虫成功或失败，均关闭浏览器和紫鸟店铺。"""
         close_error: Exception | None = None
         driver_error: Exception | None = None
+        debugging_port = self.opened.get("debuggingPort")
+
+        self._stop_ipc_heartbeat()
 
         # 当前紫鸟 V6 环境中，先 driver.quit() 可能导致 16851 IPC 一并失联。
         # 因此先调用官方 stopBrowser，确认店铺关闭后再释放本地 Selenium 会话。
         try:
-            self.client.close_store(self.browser_oauth)
+            self.client.close_store(self.browser_oauth, debugging_port)
         except Exception as exc:
             close_error = exc
         finally:
@@ -310,6 +492,24 @@ class ZiniaoStoreSession:
                 else:
                     # stopBrowser 已关闭浏览器后，driver.quit() 可能因连接已断开而失败，可安全忽略。
                     LOGGER.info("店铺 %s 已由 stopBrowser 关闭，WebDriver 会话已随浏览器断开: %s", self.store_name, exc)
+
+        if close_error and self.client.confirm_browser_closed(debugging_port):
+            # 本次日志中的实际路径：stopBrowser 因 IPC 失联失败，但随后 driver.quit() 已关闭浏览器。
+            # 此时重新拉起 IPC；浏览器关闭和 IPC 恢复都确认成功后，才允许继续下一店铺。
+            LOGGER.warning(
+                "[紫鸟][关闭二次确认] 店铺=%s，stopBrowser 未成功返回，但 driver.quit() 后浏览器已确认关闭，开始恢复 IPC",
+                self.store_name,
+            )
+            if self.client.recover_ipc():
+                LOGGER.warning(
+                    "[紫鸟][关闭二次确认成功] 店铺=%s，浏览器已关闭且 IPC 已恢复，允许继续下一店铺",
+                    self.store_name,
+                )
+                close_error = None
+            else:
+                close_error = ZiniaoStoreCloseError(
+                    f"店铺 {self.store_name} 浏览器已经关闭，但紫鸟 IPC 恢复失败，不能继续下一店铺"
+                )
 
         if close_error:
             LOGGER.critical("关闭店铺 %s 失败，禁止继续打开下一店铺: %s", self.store_name, close_error)

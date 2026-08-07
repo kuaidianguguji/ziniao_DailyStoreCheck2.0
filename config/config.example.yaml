@@ -5,6 +5,8 @@ ziniao:
     client_path: ""
     webdriver_path: ""
     socket_port: 16851
+    # 店铺运行期间每隔多少秒用只读请求维持并检查紫鸟 IPC，建议保持 60 秒。
+    ipc_keepalive_seconds: 60
   # 推荐在环境变量中填写，不要提交真实账号和密码。
   user_info:
     company: ""
