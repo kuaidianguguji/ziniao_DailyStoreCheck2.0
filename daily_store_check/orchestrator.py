@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -63,6 +64,38 @@ TIKTOK_FORMULA_FIELDS: frozenset[str] = frozenset(
         "7天GMV直播比",
         "7天ROI",
     }
+)
+
+
+# Shopee 多维表和历史电子表的固定 26 字段顺序，严格采用用户提供的表格顺序。
+# 除店铺名和采集时间外，其余 24 个字段全部来自 SP_auto.py 的指标结果。
+SHOPEE_TABLE_FIELD_ORDER: tuple[str, ...] = (
+    "店铺名",
+    "7天ALL销售额",
+    "昨天ALL广告支出回报率",
+    "7天ALL订单量",
+    "7天ALL广告支出回报率",
+    "7天ALL优惠券带来销售额",
+    "昨天ALL优惠价金额",
+    "7天ALL优惠价金额",
+    "7天ALL商品已出售",
+    "昨天ALL点击数",
+    "昨天ALL订单量",
+    "7天ALL点击数",
+    "昨天ALL加购率",
+    "7天ALL点击率",
+    "昨天ALL商品已出售",
+    "7天ALL展示次数",
+    "昨天ALL花费",
+    "昨天ALL优惠券带来销售额",
+    "7天ALL加购次数",
+    "昨天ALL展示次数",
+    "昨天ALL加购次数",
+    "7天ALL加购率",
+    "采集时间",
+    "昨天ALL销售额",
+    "7天ALL花费",
+    "昨天ALL点击率",
 )
 
 
@@ -130,6 +163,9 @@ class DailyStoreCheck:
 
     def run_once(self) -> None:
         """执行一轮任务；店铺永远按控制表顺序串行处理。"""
+        # ALL_info 保存本轮所有平台、所有店铺的采集结果和失败状态。
+        # 它只在全部店铺结束后用于 summary_recipients 汇总推送，不影响每店铺即时推送。
+        ALL_info: list[dict[str, Any]] = []
         tasks = self.feishu.list_control_tasks()
         if not tasks:
             LOGGER.info("没有可执行店铺，可能是控制表为空、开关暂停或飞书尚未配置")
@@ -138,10 +174,15 @@ class DailyStoreCheck:
         try:
             self._prepare_ziniao()
             for task in tasks:
-                self._run_store(task)
+                ALL_info.append(self._run_store(task))
             self._cleanup_retention()
         finally:
-            self.ziniao.exit_client()
+            # 即使旧数据清理或某个店铺异常，也尽量发送已经收集到的最终汇总；
+            # 无论汇总推送是否成功，最后都必须退出紫鸟客户端。
+            try:
+                self._send_all_info_summary(ALL_info)
+            finally:
+                self.ziniao.exit_client()
 
     def _prepare_ziniao(self) -> None:
         """启动紫鸟、更新内核并缓存全部店铺信息。"""
@@ -149,23 +190,81 @@ class DailyStoreCheck:
         self.ziniao.update_core()
         self.browser_list = self.ziniao.list_browsers()
 
-    def _run_store(self, task: StoreTask) -> None:
-        """处理一间店铺，context manager 确保关闭后才会进入下一间。"""
+    def _run_store(self, task: StoreTask) -> dict[str, Any]:
+        """处理一间店铺并返回 ALL_info 项；context manager 确保店铺串行关闭。"""
+        store_info: dict[str, Any] = {
+            "店铺名": task.store_name,
+            "平台": task.platform,
+            "状态": "未执行",
+            "采集时间": "",
+            "数据": {},
+        }
         identifier = task.browser_oauth or task.browser_id or self._find_browser_identifier(task.store_name)
         if not identifier:
             LOGGER.error("找不到店铺 %s 对应的紫鸟 browserOauth/browserId，跳过", task.store_name)
-            self._safe_notify(task.recipient, f"{task.store_name} 数据任务失败", "没有找到紫鸟店铺标识，请检查店铺名是否与紫鸟一致。")
-            return
+            error_message = "没有找到紫鸟店铺标识，请检查店铺名是否与紫鸟一致。"
+            store_info["状态"] = "失败"
+            store_info["错误"] = error_message
+            self._safe_notify(task.recipient, f"{task.store_name} 数据任务失败", error_message)
+            return store_info
 
         try:
             with ZiniaoStoreSession(self.ziniao, identifier, task.store_name) as session:
                 crawler = self._load_crawler(task.platform)
                 rows = crawler.collect(task.store_name, session.download_path, session.opened.get("debuggingPort"))
+                collected_at, metric_values = self._extract_all_info_values(rows)
+                store_info["采集时间"] = collected_at
+                store_info["数据"] = metric_values
                 self._write_feishu(task, rows)
                 self._safe_notify(task.recipient, f"{task.store_name} {task.platform} 广告数据", self._format_rows(rows))
+                store_info["状态"] = "成功"
         except Exception as exc:
             LOGGER.exception("店铺 %s 处理失败", task.store_name)
+            store_info["状态"] = "失败"
+            store_info["错误"] = str(exc)
             self._safe_notify(task.recipient, f"{task.store_name} 数据任务失败", str(exc))
+        return store_info
+
+    @staticmethod
+    def _extract_all_info_values(rows: list[dict[str, Any]]) -> tuple[Any, dict[str, Any]]:
+        """从平台爬虫结果提取采集时间和全部指标，供 ALL_info 保存。"""
+        collected_at: Any = ""
+        metric_values: dict[str, Any] = {}
+        for row in rows:
+            if not collected_at and row.get("采集时间"):
+                collected_at = row["采集时间"]
+
+            # Shopee 当前使用“一项指标一行”的通用结果结构，空值也保留在汇总中便于排错。
+            metric_name = str(row.get("指标") or "").strip()
+            if metric_name:
+                metric_values[metric_name] = row.get("数值", "")
+
+            # TikTok 和美客多使用“飞书字段”字典；后写入的同名字段覆盖前一模块。
+            platform_fields = row.get("飞书字段", {})
+            if isinstance(platform_fields, dict):
+                metric_values.update(platform_fields)
+        return collected_at, metric_values
+
+    def _send_all_info_summary(self, ALL_info: list[dict[str, Any]]) -> None:
+        """全部店铺完成后，按姓名 -> open_id 字典发送 ALL_info 最终汇总。"""
+        recipients = self.feishu.get_summary_recipients()
+        if not recipients:
+            LOGGER.info("[飞书][ALL_info汇总] summary_recipients 为空，不发送最终全店铺汇总")
+            return
+        if not ALL_info:
+            LOGGER.info("[飞书][ALL_info汇总] 本轮没有店铺结果，不发送最终全店铺汇总")
+            return
+
+        summary_text = json.dumps(ALL_info, ensure_ascii=False, indent=2, default=str)
+        LOGGER.info(
+            "[飞书][ALL_info打包] 店铺数=%s，接收人数=%s，ALL_info=%s",
+            len(ALL_info),
+            len(recipients),
+            json.dumps(ALL_info, ensure_ascii=False, default=str),
+        )
+        for recipient_name, receive_id in recipients.items():
+            LOGGER.info("[飞书][ALL_info发送] 接收人姓名=%s，准备发送全部店铺汇总", recipient_name)
+            self._safe_notify(receive_id, "全部平台全部店铺数据汇总", summary_text)
 
     def _safe_notify(self, recipient: str, title: str, content: str) -> None:
         """推送失败只记录日志，不影响关闭店铺和后续店铺。"""
@@ -205,6 +304,8 @@ class DailyStoreCheck:
         app_token, table_id = self.feishu.get_bitable_ref("data", task.platform)
         if task.platform == "tiktok":
             record_rows, spreadsheet_rows = self._build_tiktok_feishu_rows(task, rows)
+        elif task.platform == "shopee":
+            record_rows, spreadsheet_rows = self._build_shopee_feishu_rows(task, rows)
         elif task.platform == "mercado":
             record_rows, spreadsheet_rows = self._build_mercado_feishu_rows(task, rows)
         else:
@@ -222,7 +323,7 @@ class DailyStoreCheck:
         if isinstance(spreadsheet_cfg, dict):
             token = str(spreadsheet_cfg.get("token") or spreadsheet_cfg.get("spreadsheet_token") or "")
             sheet_id = str(spreadsheet_cfg.get("sheet_id") or "")
-            range_end_by_platform = {"tiktok": "AG", "mercado": "AF"}
+            range_end_by_platform = {"tiktok": "AG", "shopee": "Z", "mercado": "AF"}
             range_end = range_end_by_platform.get(task.platform, "Z")
             range_name = str(spreadsheet_cfg.get("range") or (f"{sheet_id}!A:{range_end}" if sheet_id else f"Sheet1!A:{range_end}"))
             self.feishu.append_spreadsheet_rows(token, spreadsheet_rows, range_name)
@@ -234,7 +335,7 @@ class DailyStoreCheck:
         task: StoreTask,
         rows: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], list[list[Any]]]:
-        """为尚未提供专用飞书字段结构的平台（当前为 Shopee）打包通用字段。"""
+        """为以后新增但尚未提供专用飞书字段结构的平台打包通用字段。"""
         bitable = self.config.get("feishu", {}).get("bitable", {})
         fields = bitable.get("data_fields", {})
         now = datetime.now(timezone.utc).isoformat()
@@ -339,6 +440,73 @@ class DailyStoreCheck:
         spreadsheet_values["店铺名"] = task.store_name
         spreadsheet_values["采集时间"] = collected_at
         spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in TIKTOK_TABLE_FIELD_ORDER]
+        return [bitable_record], [spreadsheet_row]
+
+    def _build_shopee_feishu_rows(
+        self,
+        task: StoreTask,
+        rows: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[list[Any]]]:
+        """把 Shopee 的 24 项指标合并成一条严格匹配 26 字段表结构的记录。"""
+        merged_fields: dict[str, Any] = {}
+        collected_at: Any = ""
+        known_fields = set(SHOPEE_TABLE_FIELD_ORDER)
+
+        for row_index, row in enumerate(rows, start=1):
+            if not collected_at and row.get("采集时间"):
+                collected_at = row["采集时间"]
+
+            # SP_auto.py 当前按“一项指标一行”返回，通过“指标”和“数值”合并。
+            metric_name = str(row.get("指标") or "").strip()
+            if metric_name:
+                if metric_name in known_fields:
+                    value = row.get("数值", "")
+                    if value not in ("", None) or metric_name not in merged_fields:
+                        merged_fields[metric_name] = value
+                else:
+                    LOGGER.warning("[飞书][SP未知字段] 第 %s 条指标=%s 不在 26 字段定义中，已忽略", row_index, metric_name)
+
+            # 同时兼容以后 SP_auto.py 直接返回“飞书字段”字典的写法。
+            platform_fields = row.get("飞书字段", {})
+            if not isinstance(platform_fields, dict):
+                LOGGER.warning("[飞书][SP打包] 第 %s 条爬虫结果的 飞书字段 不是字典，已忽略该属性", row_index)
+                continue
+            for field_name, value in platform_fields.items():
+                if field_name not in known_fields:
+                    LOGGER.warning("[飞书][SP未知字段] 字段=%s 不在 26 字段定义中，已忽略", field_name)
+                    continue
+                if value not in ("", None) or field_name not in merged_fields:
+                    merged_fields[field_name] = value
+
+        if not collected_at:
+            collected_at = datetime.now(timezone.utc).isoformat()
+
+        # 飞书金额和小数字段不能接收空字符串，因此只把非空业务指标加入请求 JSON。
+        bitable_record: dict[str, Any] = {
+            "店铺名": task.store_name,
+            "采集时间": self._to_feishu_timestamp_ms(collected_at),
+        }
+        for field_name in SHOPEE_TABLE_FIELD_ORDER:
+            if field_name in {"店铺名", "采集时间"}:
+                continue
+            value = merged_fields.get(field_name, "")
+            if value not in ("", None):
+                bitable_record[field_name] = value
+
+        missing_fields = [
+            field_name
+            for field_name in SHOPEE_TABLE_FIELD_ORDER
+            if field_name not in {"店铺名", "采集时间"}
+            and merged_fields.get(field_name, "") in ("", None)
+        ]
+        if missing_fields:
+            LOGGER.warning("[飞书][SP空字段] 以下字段本次无数据，不放入多维表请求体：%s", missing_fields)
+
+        # 历史电子表固定保留 26 列，空指标写空单元格，采集时间使用便于阅读的 ISO 文本。
+        spreadsheet_values = dict(merged_fields)
+        spreadsheet_values["店铺名"] = task.store_name
+        spreadsheet_values["采集时间"] = collected_at
+        spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in SHOPEE_TABLE_FIELD_ORDER]
         return [bitable_record], [spreadsheet_row]
 
     def _build_mercado_feishu_rows(
@@ -459,6 +627,24 @@ class DailyStoreCheck:
                     lines.append(f"{field_name}: {value * 100:.1f}%")
                 else:
                     lines.append(f"{field_name}: {value}")
+            return "\n".join(lines) if lines else "本次未抓取到有效指标，空值不会写入飞书数值字段。"
+        if any(row.get("平台") == "shopee" for row in rows):
+            merged_fields: dict[str, Any] = {}
+            for row in rows:
+                metric_name = str(row.get("指标") or "").strip()
+                value = row.get("数值", "")
+                if metric_name and value not in ("", None):
+                    merged_fields[metric_name] = value
+                platform_fields = row.get("飞书字段", {})
+                if isinstance(platform_fields, dict):
+                    for field_name, field_value in platform_fields.items():
+                        if field_value not in ("", None):
+                            merged_fields[field_name] = field_value
+            lines = [
+                f"{field_name}: {merged_fields[field_name]}"
+                for field_name in SHOPEE_TABLE_FIELD_ORDER
+                if field_name not in {"店铺名", "采集时间"} and field_name in merged_fields
+            ]
             return "\n".join(lines) if lines else "本次未抓取到有效指标，空值不会写入飞书数值字段。"
         lines = []
         for row in rows[:20]:

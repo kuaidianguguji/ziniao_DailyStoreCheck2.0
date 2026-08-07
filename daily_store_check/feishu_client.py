@@ -54,6 +54,30 @@ class FeishuClient:
             return default_token, str(value or "")
         raise ValueError(f"未知多维表类型: {kind}")
 
+    def get_summary_recipients(self) -> dict[str, str]:
+        """读取最终汇总接收人字典，返回“姓名 -> 接收 ID”的有效配置。"""
+        robot = self.config.get("robot", {})
+        raw_recipients = robot.get("summary_recipients", {})
+        if raw_recipients in (None, ""):
+            return {}
+        if not isinstance(raw_recipients, dict):
+            LOGGER.error("[飞书][汇总接收人配置错误] summary_recipients 必须是字典，当前类型=%s", type(raw_recipients).__name__)
+            return {}
+
+        receive_id_type = str(robot.get("receive_id_type") or "open_id").strip()
+        recipients: dict[str, str] = {}
+        for raw_name, raw_receive_id in raw_recipients.items():
+            name = str(raw_name or "").strip()
+            receive_id = str(raw_receive_id or "").strip()
+            if not name or not receive_id:
+                LOGGER.warning("[飞书][汇总接收人跳过] 姓名或 %s 为空：name=%r", receive_id_type, name)
+                continue
+            if receive_id_type == "open_id" and not receive_id.startswith("ou_"):
+                LOGGER.warning("[飞书][汇总接收人跳过] 姓名=%s 的值不是 open_id（应以 ou_ 开头）", name)
+                continue
+            recipients[name] = receive_id
+        return recipients
+
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         """统一发送请求并检查飞书 code，避免每个接口重复写错误处理。"""
         safe_path = self._safe_path_for_log(path)
@@ -306,7 +330,7 @@ class FeishuClient:
         )
 
     def send_robot_message(self, recipient: str, title: str, content: str) -> None:
-        """优先使用应用机器人按 open_id 定向推送，否则使用 webhook。"""
+        """优先按 robot.receive_id_type 使用应用机器人定向推送，否则使用 webhook。"""
         recipients = [item.strip() for item in recipient.split(",") if item.strip()]
         if recipients and self.config.get("app_id") and self.config.get("app_secret"):
             receive_id_type = self.config.get("robot", {}).get("receive_id_type", "open_id")

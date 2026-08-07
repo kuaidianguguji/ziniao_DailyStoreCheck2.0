@@ -115,7 +115,8 @@ PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
 # ---------------------------------------------------------------------------
 
 # kind 可选值：
-# integer=整数；percent=百分比文本；currency=巴西雷亚尔两位小数；decimal=普通两位小数。
+# integer=整数；percent=页面百分数去掉百分号后的两位小数；
+# currency=巴西雷亚尔两位小数；decimal=普通两位小数。
 # 同一指标在昨天和 7 天页面通常使用相同 XPath，但仍分别保留，方便页面差异化维护。
 # 用户补充 XPath 时，金额使用 kind=currency，数量使用 kind=integer，百分比使用 kind=percent。
 METRIC_SPECS: list[dict[str, str]] = [
@@ -126,7 +127,7 @@ METRIC_SPECS: list[dict[str, str]] = [
     {"period": "昨天", "field": "昨天ALL商品已出售", "xpath": '//div[@class="line-metrics"]/div[5]//div[@class="content"]//span', "kind": "integer"},
     {"period": "昨天", "field": "昨天ALL销售额", "xpath": '//div[@class="line-metrics"]/div[6]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
     {"period": "昨天", "field": "昨天ALL优惠价金额", "xpath": '//div[@class="line-metrics"]/div[9]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
-    {"period": "昨天", "field": "昨天ALL优惠劵带来销售额", "xpath": '//div[@class="line-metrics"]/div[10]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
+    {"period": "昨天", "field": "昨天ALL优惠券带来销售额", "xpath": '//div[@class="line-metrics"]/div[10]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
     {"period": "昨天", "field": "昨天ALL加购次数", "xpath": '//div[@class="line-metrics"]/div[11]//div[@class="content"]//span', "kind": "integer"},
     {"period": "昨天", "field": "昨天ALL加购率", "xpath": '//div[@class="line-metrics"]/div[12]//div[@class="content"]//span', "kind": "percent"},
     {"period": "昨天", "field": "昨天ALL花费", "xpath": '//div[@class="line-metrics"]/div[7]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
@@ -138,7 +139,7 @@ METRIC_SPECS: list[dict[str, str]] = [
     {"period": "7天", "field": "7天ALL商品已出售", "xpath": '//div[@class="line-metrics"]/div[5]//div[@class="content"]//span', "kind": "integer"},
     {"period": "7天", "field": "7天ALL销售额", "xpath": '//div[@class="line-metrics"]/div[6]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
     {"period": "7天", "field": "7天ALL优惠价金额", "xpath": '//div[@class="line-metrics"]/div[9]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
-    {"period": "7天", "field": "7天ALL优惠劵带来销售额", "xpath": '//div[@class="line-metrics"]/div[10]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
+    {"period": "7天", "field": "7天ALL优惠券带来销售额", "xpath": '//div[@class="line-metrics"]/div[10]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
     {"period": "7天", "field": "7天ALL加购次数", "xpath": '//div[@class="line-metrics"]/div[11]//div[@class="content"]//span', "kind": "integer"},
     {"period": "7天", "field": "7天ALL加购率", "xpath": '//div[@class="line-metrics"]/div[12]//div[@class="content"]//span', "kind": "percent"},
     {"period": "7天", "field": "7天ALL花费", "xpath": '//div[@class="line-metrics"]/div[7]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
@@ -595,7 +596,7 @@ class ShopeeAuto:
 
     @staticmethod
     def _format_value(raw_text: str, kind: str) -> Any:
-        """转换 Shopee 数值：BRL 两位小数、整数、百分比文本和普通小数。"""
+        """转换 Shopee 数值：BRL、普通小数和百分数均保留两位，数量转为整数。"""
         if not raw_text:
             return ""
         if kind == "integer":
@@ -615,7 +616,9 @@ class ShopeeAuto:
         if kind == "decimal":
             return round(number, 2)
         if kind == "percent":
-            return f"{number:.1f}%"
+            # Shopee 飞书表中的点击率和加购率是“小数”字段，不是“进度/百分比”字段。
+            # 页面 7,61% 因此写入数值 7.61，不能发送字符串 "7.61%"。
+            return round(number, 2)
         return raw_text
 
     @staticmethod
