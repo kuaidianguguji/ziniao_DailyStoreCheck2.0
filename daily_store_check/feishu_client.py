@@ -31,6 +31,8 @@ class FeishuClient:
         self.base_url = str(self.config.get("base_url", "https://open.feishu.cn")).rstrip("/")
         self.timeout = int(config.get("data", {}).get("request_timeout_seconds", 30))
         self._tenant_token = ""
+        # 同一轮任务中每张表的字段结构只读取一次，避免每个店铺重复请求字段接口。
+        self._table_field_names_cache: dict[tuple[str, str], set[str]] = {}
         self.session = requests.Session()
 
     @property
@@ -77,6 +79,43 @@ class FeishuClient:
                 continue
             recipients[name] = receive_id
         return recipients
+
+    def list_table_field_names(self, table_id: str, app_token: str = "") -> set[str]:
+        """读取多维表的真实字段名称并缓存，用于写入前校验 FieldNameNotFound。"""
+        if not self.configured or not app_token or not table_id:
+            LOGGER.warning("[飞书][字段列表] app_token/table_id 或应用凭据不完整，无法读取真实字段")
+            return set()
+
+        cache_key = (app_token, table_id)
+        if cache_key in self._table_field_names_cache:
+            return set(self._table_field_names_cache[cache_key])
+
+        field_names: set[str] = set()
+        page_token = ""
+        while True:
+            params: dict[str, Any] = {"page_size": 100}
+            if page_token:
+                params["page_token"] = page_token
+            payload = self._request(
+                "GET",
+                f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
+                headers=self._headers(),
+                params=params,
+            )
+            data = payload.get("data", {})
+            for item in data.get("items", []):
+                field_name = str(item.get("field_name") or "")
+                if field_name:
+                    field_names.add(field_name)
+            if not data.get("has_more"):
+                break
+            page_token = str(data.get("page_token") or "")
+            if not page_token:
+                break
+
+        self._table_field_names_cache[cache_key] = set(field_names)
+        LOGGER.info("[飞书][字段列表] table_id=%s，读取真实字段数=%s，字段=%s", table_id, len(field_names), sorted(field_names))
+        return field_names
 
     def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         """统一发送请求并检查飞书 code，避免每个接口重复写错误处理。"""

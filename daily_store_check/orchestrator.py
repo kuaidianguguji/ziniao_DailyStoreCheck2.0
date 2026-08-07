@@ -5,12 +5,13 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
 from .config import StoreTask
 from .feishu_client import FeishuClient
-from .ziniao_client import ZiniaoClient, ZiniaoStoreSession
+from .ziniao_client import ZiniaoClient, ZiniaoStoreCloseError, ZiniaoStoreSession
 
 LOGGER = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ SHOPEE_TABLE_FIELD_ORDER: tuple[str, ...] = (
     "昨天ALL广告支出回报率",
     "7天ALL订单量",
     "7天ALL广告支出回报率",
-    "7天ALL优惠券带来销售额",
+    "7天ALL优惠劵带来销售额",
     "昨天ALL优惠价金额",
     "7天ALL优惠价金额",
     "7天ALL商品已出售",
@@ -87,7 +88,7 @@ SHOPEE_TABLE_FIELD_ORDER: tuple[str, ...] = (
     "昨天ALL商品已出售",
     "7天ALL展示次数",
     "昨天ALL花费",
-    "昨天ALL优惠券带来销售额",
+    "昨天ALL优惠劵带来销售额",
     "7天ALL加购次数",
     "昨天ALL展示次数",
     "昨天ALL加购次数",
@@ -173,9 +174,18 @@ class DailyStoreCheck:
 
         try:
             self._prepare_ziniao()
+            close_failed = False
             for task in tasks:
-                ALL_info.append(self._run_store(task))
-            self._cleanup_retention()
+                store_info = self._run_store(task)
+                ALL_info.append(store_info)
+                if store_info.get("中止后续店铺"):
+                    LOGGER.critical("店铺 %s 未确认关闭，本轮不再打开后续店铺", task.store_name)
+                    close_failed = True
+                    break
+            if close_failed:
+                LOGGER.warning("本轮因店铺未确认关闭而提前结束，跳过90天数据清理并立即进入最终收尾")
+            else:
+                self._cleanup_retention()
         finally:
             # 即使旧数据清理或某个店铺异常，也尽量发送已经收集到的最终汇总；
             # 无论汇总推送是否成功，最后都必须退出紫鸟客户端。
@@ -218,6 +228,12 @@ class DailyStoreCheck:
                 self._write_feishu(task, rows)
                 self._safe_notify(task.recipient, f"{task.store_name} {task.platform} 广告数据", self._format_rows(rows))
                 store_info["状态"] = "成功"
+        except ZiniaoStoreCloseError as exc:
+            LOGGER.exception("店铺 %s 未能关闭，必须中止后续店铺", task.store_name)
+            store_info["状态"] = "失败"
+            store_info["错误"] = str(exc)
+            store_info["中止后续店铺"] = True
+            self._safe_notify(task.recipient, f"{task.store_name} 关闭失败", f"{exc}\n为避免同时打开多个店铺，已中止本轮后续店铺。")
         except Exception as exc:
             LOGGER.exception("店铺 %s 处理失败", task.store_name)
             store_info["状态"] = "失败"
@@ -237,7 +253,7 @@ class DailyStoreCheck:
             # Shopee 当前使用“一项指标一行”的通用结果结构，空值也保留在汇总中便于排错。
             metric_name = str(row.get("指标") or "").strip()
             if metric_name:
-                metric_values[metric_name] = row.get("数值", "")
+                metric_values[metric_name] = row.get("显示值", row.get("数值", ""))
 
             # TikTok 和美客多使用“飞书字段”字典；后写入的同名字段覆盖前一模块。
             platform_fields = row.get("飞书字段", {})
@@ -318,17 +334,94 @@ class DailyStoreCheck:
             len(record_rows),
             len(spreadsheet_rows),
         )
-        self.feishu.batch_create_records(table_id, record_rows, app_token=app_token)
-        spreadsheet_cfg = feishu_cfg.get("spreadsheets", {}).get(task.platform, "")
-        if isinstance(spreadsheet_cfg, dict):
-            token = str(spreadsheet_cfg.get("token") or spreadsheet_cfg.get("spreadsheet_token") or "")
-            sheet_id = str(spreadsheet_cfg.get("sheet_id") or "")
-            range_end_by_platform = {"tiktok": "AG", "shopee": "Z", "mercado": "AF"}
-            range_end = range_end_by_platform.get(task.platform, "Z")
-            range_name = str(spreadsheet_cfg.get("range") or (f"{sheet_id}!A:{range_end}" if sheet_id else f"Sheet1!A:{range_end}"))
-            self.feishu.append_spreadsheet_rows(token, spreadsheet_rows, range_name)
-        else:
-            self.feishu.append_spreadsheet_rows(str(spreadsheet_cfg), spreadsheet_rows)
+        write_errors: list[str] = []
+
+        # 多维表和历史电子表是两个独立目标；一个失败时仍然尝试另一个，避免采集数据全部丢失。
+        try:
+            bitable_rows = record_rows
+            if task.platform == "shopee":
+                bitable_rows = self._align_shopee_bitable_fields(record_rows, app_token, table_id)
+            self.feishu.batch_create_records(table_id, bitable_rows, app_token=app_token)
+        except Exception as exc:
+            LOGGER.exception("[飞书][多维表写入失败] 店铺=%s，平台=%s", task.store_name, task.platform)
+            write_errors.append(f"多维表写入失败: {exc}")
+
+        try:
+            spreadsheet_cfg = feishu_cfg.get("spreadsheets", {}).get(task.platform, "")
+            if isinstance(spreadsheet_cfg, dict):
+                token = str(spreadsheet_cfg.get("token") or spreadsheet_cfg.get("spreadsheet_token") or "")
+                sheet_id = str(spreadsheet_cfg.get("sheet_id") or "")
+                range_end_by_platform = {"tiktok": "AG", "shopee": "Z", "mercado": "AF"}
+                range_end = range_end_by_platform.get(task.platform, "Z")
+                range_name = str(spreadsheet_cfg.get("range") or (f"{sheet_id}!A:{range_end}" if sheet_id else f"Sheet1!A:{range_end}"))
+                self.feishu.append_spreadsheet_rows(token, spreadsheet_rows, range_name)
+            else:
+                self.feishu.append_spreadsheet_rows(str(spreadsheet_cfg), spreadsheet_rows)
+        except Exception as exc:
+            LOGGER.exception("[飞书][电子表写入失败] 店铺=%s，平台=%s", task.store_name, task.platform)
+            write_errors.append(f"电子表写入失败: {exc}")
+
+        if write_errors:
+            raise RuntimeError("；".join(write_errors))
+
+    def _align_shopee_bitable_fields(
+        self,
+        records: list[dict[str, Any]],
+        app_token: str,
+        table_id: str,
+    ) -> list[dict[str, Any]]:
+        """按飞书真实字段名对齐 Shopee 记录，兼容“券/劵”和首尾空格差异。"""
+        try:
+            actual_fields = self.feishu.list_table_field_names(table_id, app_token=app_token)
+        except Exception:
+            LOGGER.exception("[飞书][SP字段预检失败] 无法读取真实字段，暂时沿用代码字段名")
+            return records
+        if not actual_fields:
+            return records
+
+        actual_by_normalized: dict[str, list[str]] = {}
+        for actual_name in actual_fields:
+            normalized = self._normalise_feishu_field_name(actual_name)
+            actual_by_normalized.setdefault(normalized, []).append(actual_name)
+
+        aligned_records: list[dict[str, Any]] = []
+        for record_index, record in enumerate(records, start=1):
+            aligned: dict[str, Any] = {}
+            missing_required: list[str] = []
+            for code_name, value in record.items():
+                if code_name in actual_fields:
+                    aligned[code_name] = value
+                    continue
+
+                candidates = actual_by_normalized.get(self._normalise_feishu_field_name(code_name), [])
+                if len(candidates) == 1:
+                    actual_name = candidates[0]
+                    aligned[actual_name] = value
+                    LOGGER.warning("[飞书][SP字段自动对齐] 代码字段=%r -> 真实字段=%r", code_name, actual_name)
+                    continue
+
+                if code_name in {"店铺名", "采集时间"}:
+                    missing_required.append(code_name)
+                elif len(candidates) > 1:
+                    LOGGER.error("[飞书][SP字段歧义] 代码字段=%r 匹配到多个真实字段=%s，本次跳过", code_name, candidates)
+                else:
+                    LOGGER.error("[飞书][SP字段不存在] 代码字段=%r 不在真实多维表中，本次跳过该字段", code_name)
+
+            if missing_required:
+                raise RuntimeError(f"Shopee 多维表缺少必要字段: {missing_required}")
+            aligned_records.append(aligned)
+            LOGGER.info(
+                "[飞书][SP字段预检完成] 第 %s 条记录，发送字段数=%s，字段=%s",
+                record_index,
+                len(aligned),
+                list(aligned),
+            )
+        return aligned_records
+
+    @staticmethod
+    def _normalise_feishu_field_name(field_name: str) -> str:
+        """仅用于字段匹配：统一全半角、首尾空格，并把易混淆的“劵”归一为“券”。"""
+        return unicodedata.normalize("NFKC", str(field_name)).strip().replace("劵", "券")
 
     def _build_default_feishu_rows(
         self,
@@ -632,7 +725,7 @@ class DailyStoreCheck:
             merged_fields: dict[str, Any] = {}
             for row in rows:
                 metric_name = str(row.get("指标") or "").strip()
-                value = row.get("数值", "")
+                value = row.get("显示值", row.get("数值", ""))
                 if metric_name and value not in ("", None):
                     merged_fields[metric_name] = value
                 platform_fields = row.get("飞书字段", {})

@@ -27,6 +27,14 @@ LOGGER = logging.getLogger(__name__)
 # 一、Shopee 广告页面按钮 XPath
 # ---------------------------------------------------------------------------
 
+# Shopee 未登录页面可能因语言或版本不同而使用不同的登录按钮。
+# 程序严格按列表顺序检查：第一个 XPath 没找到可见元素时，才检查第二个 XPath。
+# 以后遇到新的登录页面，可以继续在列表末尾追加 XPath，不需要修改登录处理函数。
+LOGIN_BUTTON_XPATHS: list[str] = [
+    "//form//button[contains(@class,'ZzzLTG')]",
+    '//button[normalize-space()="Log In"]',
+]
+
 # 如果“Shopee广告”不可见，需要先点击“营销中心”展开菜单。
 MARKETING_CENTER_BUTTON_XPATH = '(//ul[@class="sidebar-menu"]/li)[3]//span[@class="sidebar-menu-item-text"]'
 
@@ -34,11 +42,11 @@ MARKETING_CENTER_BUTTON_XPATH = '(//ul[@class="sidebar-menu"]/li)[3]//span[@clas
 SHOPEE_AD_BUTTON_XPATH = '//a[contains(@href,"/portal/marketing/pas/index")]'
 
 # 广告页面的时间切换按钮。
-TIME_SWITCH_BUTTON_XPATH = '//div[@class="eds-popover__ref"]//div[@class="eds-date-picker__input"]'
+TIME_SWITCH_BUTTON_XPATH = '//div[@class="eds-popover__ref"]//div[@class="eds-date-picker__input"]/div'
 
 # 时间面板中的“昨天”和“最近7天”选项。
-YESTERDAY_OPTION_XPATH = '//ul[@class="eds-date-shortcut-list"]/li[2]'
-LAST_7_DAYS_OPTION_XPATH = '//ul[@class="eds-date-shortcut-list"]/li[3]'
+YESTERDAY_OPTION_XPATH = '//ul[@class="eds-date-shortcut-list"]/li[2]//span'
+LAST_7_DAYS_OPTION_XPATH = '//ul[@class="eds-date-shortcut-list"]/li[3]//span'
 
 
 # 页面主文档加载完成的最长等待时间，单位为秒。
@@ -127,7 +135,7 @@ METRIC_SPECS: list[dict[str, str]] = [
     {"period": "昨天", "field": "昨天ALL商品已出售", "xpath": '//div[@class="line-metrics"]/div[5]//div[@class="content"]//span', "kind": "integer"},
     {"period": "昨天", "field": "昨天ALL销售额", "xpath": '//div[@class="line-metrics"]/div[6]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
     {"period": "昨天", "field": "昨天ALL优惠价金额", "xpath": '//div[@class="line-metrics"]/div[9]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
-    {"period": "昨天", "field": "昨天ALL优惠券带来销售额", "xpath": '//div[@class="line-metrics"]/div[10]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
+    {"period": "昨天", "field": "昨天ALL优惠劵带来销售额", "xpath": '//div[@class="line-metrics"]/div[10]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
     {"period": "昨天", "field": "昨天ALL加购次数", "xpath": '//div[@class="line-metrics"]/div[11]//div[@class="content"]//span', "kind": "integer"},
     {"period": "昨天", "field": "昨天ALL加购率", "xpath": '//div[@class="line-metrics"]/div[12]//div[@class="content"]//span', "kind": "percent"},
     {"period": "昨天", "field": "昨天ALL花费", "xpath": '//div[@class="line-metrics"]/div[7]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
@@ -139,7 +147,7 @@ METRIC_SPECS: list[dict[str, str]] = [
     {"period": "7天", "field": "7天ALL商品已出售", "xpath": '//div[@class="line-metrics"]/div[5]//div[@class="content"]//span', "kind": "integer"},
     {"period": "7天", "field": "7天ALL销售额", "xpath": '//div[@class="line-metrics"]/div[6]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
     {"period": "7天", "field": "7天ALL优惠价金额", "xpath": '//div[@class="line-metrics"]/div[9]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
-    {"period": "7天", "field": "7天ALL优惠券带来销售额", "xpath": '//div[@class="line-metrics"]/div[10]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
+    {"period": "7天", "field": "7天ALL优惠劵带来销售额", "xpath": '//div[@class="line-metrics"]/div[10]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
     {"period": "7天", "field": "7天ALL加购次数", "xpath": '//div[@class="line-metrics"]/div[11]//div[@class="content"]//span', "kind": "integer"},
     {"period": "7天", "field": "7天ALL加购率", "xpath": '//div[@class="line-metrics"]/div[12]//div[@class="content"]//span', "kind": "percent"},
     {"period": "7天", "field": "7天ALL花费", "xpath": '//div[@class="line-metrics"]/div[7]//div[@class="content"]//span', "kind": "currency", "currency_code": "BRL"},
@@ -175,6 +183,9 @@ class ShopeeAuto:
         LOGGER.info("[Shopee][页面] 主文档等待结束，额外等待 %s 秒让菜单完成渲染", AFTER_PAGE_READY_WAIT_SECONDS)
         time.sleep(AFTER_PAGE_READY_WAIT_SECONDS)
 
+        # 页面可能处于未登录状态；按配置顺序检查多个登录按钮 XPath。
+        self._login_if_needed(tab)
+
         # 广告按钮可见时直接点击；不可见时先展开营销中心。
         first_period_xpath = self._first_step_xpath(PERIOD_CLICK_STEPS.get("昨天", []))
         self._enter_shopee_ads(tab, first_period_xpath)
@@ -201,13 +212,15 @@ class ShopeeAuto:
                 )
                 raw_text = self._read_xpath(tab, xpath, field_name)
                 converted_value = self._format_value(raw_text, value_kind)
+                display_value = self._format_display_value(converted_value, value_kind)
                 LOGGER.info(
-                    "[Shopee][指标结果] 字段=%s，原始值=%r，原始类型=%s，转换值=%r，转换后类型=%s，配置类型=%s，币种=%s",
+                    "[Shopee][指标结果] 字段=%s，原始值=%r，原始类型=%s，飞书数值=%r，数值类型=%s，显示值=%r，配置类型=%s，币种=%s",
                     field_name,
                     raw_text,
                     type(raw_text).__name__,
                     converted_value,
                     type(converted_value).__name__,
+                    display_value,
                     value_kind,
                     currency_code or "无",
                 )
@@ -221,13 +234,16 @@ class ShopeeAuto:
                         value_kind,
                     )
 
-                # SP 多维表字段结构尚未给出，暂时使用通用的一项指标一条记录。
+                # 爬虫按“一项指标一行”返回，编排器随后合并为一条 26 字段飞书记录。
                 row = {
                     "店铺名": store_name,
                     "平台": "shopee",
                     "采集时间": collected_at,
                     "指标": field_name,
+                    # 数值用于多维表和历史电子表，必须保持 int/float，不能带 R$ 或 %。
                     "数值": converted_value,
+                    # 显示值用于机器人和 ALL_info，保留人能直接识别的货币/百分比单位。
+                    "显示值": display_value,
                     "原始数据": json.dumps(
                         {
                             "时间范围": period,
@@ -245,6 +261,51 @@ class ShopeeAuto:
         LOGGER.info("[Shopee][结果打包] rows=%s", json.dumps(rows, ensure_ascii=False, default=str))
         LOGGER.info("[Shopee][完成] 店铺=%s，有效指标=%s/%s", store_name, valid_count, len(rows))
         return rows
+
+    def _login_if_needed(self, tab: Any) -> bool:
+        """依次检查多个登录按钮；发现后点击并等待登录后的菜单出现。"""
+        configured_xpaths = [str(xpath or "").strip() for xpath in LOGIN_BUTTON_XPATHS if str(xpath or "").strip()]
+        if not configured_xpaths:
+            LOGGER.warning("[Shopee][登录检查跳过] LOGIN_BUTTON_XPATHS 没有有效 XPath")
+            return False
+
+        for index, xpath in enumerate(configured_xpaths, start=1):
+            LOGGER.info(
+                "[Shopee][登录检查] 正在检查第 %s/%s 个登录按钮，xpath=%s",
+                index,
+                len(configured_xpaths),
+                xpath,
+            )
+            login_element = self._find_visible_element(tab, xpath, timeout=3)
+            if not login_element:
+                LOGGER.info("[Shopee][登录按钮未发现] 第 %s 个 XPath 没有可见按钮，继续检查下一个", index)
+                continue
+
+            LOGGER.warning("[Shopee][未登录] 发现第 %s 个登录按钮，准备点击，xpath=%s", index, xpath)
+            clicked = self._click_with_retry(
+                tab,
+                xpath,
+                f"点击第{index}个Shopee登录按钮",
+                success_xpath=xpath,
+                success_state="hidden",
+                success_name="登录按钮消失",
+            )
+            if not clicked:
+                LOGGER.error("[Shopee][登录失败] 第 %s 个登录按钮经过首次及 3 次重试仍未成功，继续检查其他 XPath", index)
+                continue
+
+            # 登录按钮消失后，等待登录页面跳转并出现左侧菜单中的任意一个已登录标志。
+            self._wait_for_any_xpath(
+                tab,
+                [SHOPEE_AD_BUTTON_XPATH, MARKETING_CENTER_BUTTON_XPATH],
+                NEXT_ELEMENT_TIMEOUT_SECONDS,
+                "登录后的Shopee广告或营销中心菜单",
+            )
+            LOGGER.info("[Shopee][登录处理完成] 已点击第 %s 个登录按钮，继续进入广告页面", index)
+            return True
+
+        LOGGER.info("[Shopee][登录检查完成] 所有登录按钮 XPath 均不可见，按当前已经登录继续")
+        return False
 
     def _enter_shopee_ads(self, tab: Any, next_xpath: str = "") -> bool:
         """判断 Shopee 广告按钮是否可见，必要时先展开营销中心。"""
@@ -361,11 +422,11 @@ class ShopeeAuto:
                     max_attempts,
                     xpath,
                 )
-                element = self._find_visible_element(tab, xpath, timeout=5)
+                element = self._find_action_element(tab, xpath, timeout=5, target_name=step_name)
                 if not element:
                     LOGGER.warning("[Shopee][按钮未找到] 步骤=%s，第 %s/%s 次未找到可见元素", step_name, attempt + 1, max_attempts)
                     continue
-                element.click()
+                self._click_element_with_fallback(tab, element, xpath, step_name)
                 if success_xpath and success_state:
                     LOGGER.info("[Shopee][按钮已点击] 步骤=%s，开始验证=%s", step_name, success_name)
                     if not self._wait_for_element_state(
@@ -400,18 +461,39 @@ class ShopeeAuto:
             LOGGER.warning("[Shopee][滚动跳过] 目标=%s，XPath 为空", target_name)
             return False
 
-        element = self._find_visible_element(tab, xpath, timeout=3)
+        element = self._find_action_element(tab, xpath, timeout=3, target_name=target_name)
         if not element:
             LOGGER.warning("[Shopee][滚动失败] 目标=%s，未找到可见元素，xpath=%s", target_name, xpath)
             return False
 
-        # 优先使用页面 JavaScript 的 block:center，能够把元素放在视口垂直和水平中心。
+        # 优先使用 DrissionPage 自带滚动接口，真实驱动浏览器滚动到元素中心。
+        api_scrolled = False
+        try:
+            scroll_api = getattr(element, "scroll", None)
+            to_center = getattr(scroll_api, "to_center", None) if scroll_api is not None else None
+            if callable(to_center):
+                to_center()
+                api_scrolled = True
+                LOGGER.info("[Shopee][滚动API成功] 目标=%s，已通过 to_center() 定位，xpath=%s", target_name, xpath)
+            else:
+                to_see = getattr(scroll_api, "to_see", None) if scroll_api is not None else None
+                if callable(to_see):
+                    try:
+                        to_see(center=True)
+                    except TypeError:
+                        to_see()
+                    api_scrolled = True
+                    LOGGER.info("[Shopee][滚动API成功] 目标=%s，已通过 to_see() 定位，xpath=%s", target_name, xpath)
+        except Exception as exc:
+            LOGGER.warning("[Shopee][滚动API异常] 目标=%s，准备使用 JavaScript 滚动，异常=%s", target_name, exc)
+
+        # 再使用 JavaScript 的 block:center，兼容没有 DrissionPage 滚动接口的版本。
         try:
             xpath_literal = json.dumps(xpath, ensure_ascii=False)
             result = tab.run_js(
                 f"""
                 const targetXPath = {xpath_literal};
-                const target = document.evaluate(
+                let target = document.evaluate(
                     targetXPath,
                     document,
                     null,
@@ -419,6 +501,11 @@ class ShopeeAuto:
                     null
                 ).singleNodeValue;
                 if (!target) return false;
+                const originalRect = target.getBoundingClientRect();
+                // XPath 可能命中没有尺寸的内部 div/span，改用最近的父节点完成滚动。
+                if (originalRect.width <= 0 || originalRect.height <= 0) {{
+                    target = target.parentElement || target;
+                }}
                 target.scrollIntoView({{behavior: 'instant', block: 'center', inline: 'center'}});
                 return true;
                 """
@@ -427,29 +514,65 @@ class ShopeeAuto:
                 LOGGER.info("[Shopee][滚动成功] 目标=%s，已滚动到屏幕中心，xpath=%s", target_name, xpath)
                 return True
         except Exception as exc:
-            LOGGER.warning("[Shopee][滚动JS异常] 目标=%s，准备使用 DrissionPage 滚动接口，异常=%s", target_name, exc)
+            LOGGER.warning("[Shopee][滚动JS异常] 目标=%s，JavaScript 滚动失败，异常=%s", target_name, exc)
 
-        # 不同 DrissionPage 版本的滚动接口名称可能不同，因此提供兼容回退。
+        return api_scrolled
+
+    def _click_element_with_fallback(self, tab: Any, element: Any, xpath: str, step_name: str) -> None:
+        """点击元素；无尺寸时依次尝试可点击父节点和 JavaScript click。"""
         try:
-            scroll_api = getattr(element, "scroll", None)
-            to_center = getattr(scroll_api, "to_center", None) if scroll_api is not None else None
-            if callable(to_center):
-                to_center()
-                LOGGER.info("[Shopee][滚动成功] 目标=%s，已通过 DrissionPage to_center() 定位，xpath=%s", target_name, xpath)
-                return True
+            element.click()
+            return
+        except Exception as first_error:
+            LOGGER.warning(
+                "[Shopee][按钮原始点击失败] 步骤=%s，xpath=%s，异常=%s，准备尝试父节点/JS回退",
+                step_name,
+                xpath,
+                first_error,
+            )
 
-            to_see = getattr(scroll_api, "to_see", None) if scroll_api is not None else None
-            if callable(to_see):
-                try:
-                    to_see(center=True)
-                except TypeError:
-                    to_see()
-                LOGGER.info("[Shopee][滚动成功] 目标=%s，已通过 DrissionPage to_see() 定位，xpath=%s", target_name, xpath)
-                return True
-        except Exception as exc:
-            LOGGER.warning("[Shopee][滚动失败] 目标=%s，DrissionPage 滚动接口也失败：%s，xpath=%s", target_name, exc, xpath)
+        # 日期菜单通常把文字放在 span 中，真正有尺寸和点击事件的是外层 li。
+        for tag_name in ("li", "button", "a", "div"):
+            ancestor_xpath = f"({xpath})/ancestor::{tag_name}[1]"
+            ancestor = self._find_action_element(tab, ancestor_xpath, timeout=1, target_name=f"{step_name}的{tag_name}父节点")
+            if not ancestor:
+                continue
+            try:
+                ancestor.click()
+                LOGGER.info("[Shopee][按钮回退成功] 步骤=%s，已点击 %s 父节点，xpath=%s", step_name, tag_name, ancestor_xpath)
+                return
+            except Exception as ancestor_error:
+                LOGGER.warning(
+                    "[Shopee][按钮父节点回退失败] 步骤=%s，父节点=%s，异常=%s",
+                    step_name,
+                    ancestor_xpath,
+                    ancestor_error,
+                )
 
-        return False
+        # 最后一层使用 DOM click，不依赖元素的屏幕坐标，适合无尺寸但有事件绑定的 span。
+        try:
+            xpath_literal = json.dumps(xpath, ensure_ascii=False)
+            result = tab.run_js(
+                f"""
+                const target = document.evaluate(
+                    {xpath_literal},
+                    document,
+                    null,
+                    XPathResult.FIRST_ORDERED_NODE_TYPE,
+                    null
+                ).singleNodeValue;
+                if (!target) return false;
+                target.click();
+                return true;
+                """
+            )
+            if result is not False:
+                LOGGER.info("[Shopee][按钮JS回退成功] 步骤=%s，xpath=%s", step_name, xpath)
+                return
+        except Exception as js_error:
+            LOGGER.warning("[Shopee][按钮JS回退失败] 步骤=%s，异常=%s，xpath=%s", step_name, js_error, xpath)
+
+        raise RuntimeError(f"原始点击和父节点/JS回退均失败：{first_error}")
 
     def _wait_for_element_state(
         self,
@@ -468,7 +591,7 @@ class ShopeeAuto:
         hidden_checks = 0
         LOGGER.info("[Shopee][状态等待] 目标=%s，期望=%s，最长 %.1f 秒，xpath=%s", target_name, expected_state, timeout_seconds, xpath)
         while time.monotonic() < deadline:
-            visible = bool(self._find_visible_element(tab, xpath, timeout=1))
+            visible = bool(self._find_action_element(tab, xpath, timeout=1, target_name=target_name))
             if expected_state == "visible" and visible:
                 LOGGER.info("[Shopee][状态满足] 目标=%s 已出现，耗时 %.2f 秒", target_name, time.monotonic() - started_at)
                 return True
@@ -515,11 +638,37 @@ class ShopeeAuto:
         deadline = started_at + timeout_seconds
         LOGGER.info("[Shopee][元素等待] 目标=%s，最长 %.1f 秒，xpath=%s", target_name, timeout_seconds, xpath)
         while time.monotonic() < deadline:
-            if self._find_visible_element(tab, xpath, timeout=1):
+            if self._find_action_element(tab, xpath, timeout=1, target_name=target_name):
                 LOGGER.info("[Shopee][元素出现] 目标=%s，耗时 %.2f 秒", target_name, time.monotonic() - started_at)
                 return True
             time.sleep(1)
         LOGGER.error("[Shopee][元素超时] 目标=%s，等待 %.1f 秒仍未出现，xpath=%s", target_name, timeout_seconds, xpath)
+        return False
+
+    def _wait_for_any_xpath(self, tab: Any, xpaths: list[str], timeout_seconds: float, target_name: str) -> bool:
+        """等待多个 XPath 中任意一个出现，适用于登录后菜单可能有不同展开状态的页面。"""
+        candidates = [str(xpath or "").strip() for xpath in xpaths if str(xpath or "").strip()]
+        if not candidates:
+            LOGGER.warning("[Shopee][多元素等待] 目标=%s 没有有效 XPath，固定等待 %.1f 秒", target_name, timeout_seconds)
+            time.sleep(timeout_seconds)
+            return True
+
+        started_at = time.monotonic()
+        deadline = started_at + timeout_seconds
+        LOGGER.info("[Shopee][多元素等待] 目标=%s，候选数=%s，最长 %.1f 秒", target_name, len(candidates), timeout_seconds)
+        while time.monotonic() < deadline:
+            for index, xpath in enumerate(candidates, start=1):
+                if self._find_action_element(tab, xpath, timeout=1, target_name=target_name):
+                    LOGGER.info(
+                        "[Shopee][多元素出现] 目标=%s，第 %s 个候选已出现，耗时 %.2f 秒，xpath=%s",
+                        target_name,
+                        index,
+                        time.monotonic() - started_at,
+                        xpath,
+                    )
+                    return True
+            time.sleep(1)
+        LOGGER.error("[Shopee][多元素超时] 目标=%s，等待 %.1f 秒仍没有候选元素出现", target_name, timeout_seconds)
         return False
 
     def _read_xpath(self, tab: Any, xpath: str, field_name: str) -> str:
@@ -571,9 +720,82 @@ class ShopeeAuto:
         except Exception:
             return None
 
+    def _find_action_element(self, tab: Any, xpath: str, timeout: float = 1, target_name: str = "") -> Any:
+        """查找真正有位置和尺寸的元素；无尺寸时回退到最近可点击父节点。"""
+        element = self._find_visible_element(tab, xpath, timeout=timeout)
+        if not element:
+            return None
+        if self._element_has_geometry(element) and self._element_is_really_visible(tab, xpath, element):
+            return element
+
+        # 原 XPath 可能命中仅用于包裹文字的 span/div，优先选择菜单常见的可点击父节点。
+        for tag_name in ("li", "button", "a", "div"):
+            ancestor_xpath = f"({xpath})/ancestor::{tag_name}[1]"
+            ancestor = self._find_visible_element(tab, ancestor_xpath, timeout=timeout)
+            if ancestor and self._element_has_geometry(ancestor) and self._element_is_really_visible(tab, ancestor_xpath, ancestor):
+                LOGGER.info(
+                    "[Shopee][元素父节点回退] 目标=%s，原 XPath 无尺寸，改用 %s 父节点：%s",
+                    target_name or xpath,
+                    tag_name,
+                    ancestor_xpath,
+                )
+                return ancestor
+        return None
+
+    @staticmethod
+    def _element_has_geometry(element: Any) -> bool:
+        """判断 DrissionPage 元素是否有可用于鼠标操作的位置和尺寸。"""
+        try:
+            rect = getattr(element, "rect", None)
+            size = getattr(rect, "size", None) if rect is not None else None
+            if size is None:
+                # 某些 DrissionPage 版本没有暴露 rect.size，交给 click() 自己判断。
+                return True
+            width, height = float(size[0]), float(size[1])
+            return width > 0 and height > 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _element_is_really_visible(tab: Any, xpath: str, element: Any) -> bool:
+        """检查元素没有被 CSS 隐藏，并且至少有一部分位于当前浏览器视口内。"""
+        try:
+            xpath_literal = json.dumps(xpath, ensure_ascii=False)
+            result = tab.run_js(
+                f"""
+                const target = document.evaluate(
+                    {xpath_literal},
+                    document,
+                    null,
+                    XPathResult.FIRST_ORDERED_NODE_TYPE,
+                    null
+                ).singleNodeValue;
+                if (!target) return {{visible: false}};
+                const rect = target.getBoundingClientRect();
+                let current = target;
+                while (current && current.nodeType === 1) {{
+                    const style = window.getComputedStyle(current);
+                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') {{
+                        return {{visible: false, reason: 'css-hidden'}};
+                    }}
+                    current = current.parentElement;
+                }}
+                const inViewport = rect.width > 0 && rect.height > 0 &&
+                    rect.bottom > 0 && rect.right > 0 &&
+                    rect.top < window.innerHeight && rect.left < window.innerWidth;
+                return {{visible: inViewport, width: rect.width, height: rect.height}};
+                """
+            )
+            if isinstance(result, dict) and "visible" in result:
+                return bool(result["visible"])
+        except Exception:
+            # run_js 不同版本返回值不同，回退到 DrissionPage 的尺寸判断。
+            pass
+        return ShopeeAuto._element_has_geometry(element)
+
     def _element_state_matches(self, tab: Any, xpath: str, expected_state: str) -> bool:
         """立即判断元素状态，用于重试前确认上次点击是否延迟生效。"""
-        visible = bool(self._find_visible_element(tab, xpath, timeout=0.5))
+        visible = bool(self._find_action_element(tab, xpath, timeout=0.5, target_name="点击后的页面状态"))
         if expected_state == "visible":
             return visible
         if expected_state == "hidden":
@@ -600,13 +822,7 @@ class ShopeeAuto:
         if not raw_text:
             return ""
         if kind == "integer":
-            integer_text = re.sub(r"[^0-9-]", "", str(raw_text))
-            if not integer_text or integer_text == "-":
-                return ""
-            try:
-                return int(integer_text)
-            except ValueError:
-                return ""
+            return ShopeeAuto._parse_integer(raw_text)
 
         number = ShopeeAuto._parse_brazilian_number(raw_text)
         if number is None:
@@ -620,6 +836,54 @@ class ShopeeAuto:
             # 页面 7,61% 因此写入数值 7.61，不能发送字符串 "7.61%"。
             return round(number, 2)
         return raw_text
+
+    @staticmethod
+    def _format_display_value(value: Any, kind: str) -> str:
+        """为机器人消息格式化单位；飞书写入仍使用独立的纯数字 value。"""
+        if value in ("", None):
+            return ""
+        try:
+            if kind == "currency":
+                # 巴西原始格式 R$17.490,26 规范显示为 R$17490.26。
+                return f"R${float(value):.2f}"
+            if kind == "percent":
+                # 巴西原始格式 3,79% 规范显示为 3.79%。
+                return f"{float(value):.2f}%"
+            if kind == "decimal":
+                return f"{float(value):.2f}"
+            if kind == "integer":
+                return str(int(value))
+        except (TypeError, ValueError):
+            return ""
+        return str(value)
+
+    @staticmethod
+    def _parse_integer(raw_text: str) -> int | str:
+        """解析整数和 Shopee 缩写数量，例如 10.7k -> 10700、1,2 mil -> 1200。"""
+        text = str(raw_text or "").strip().lower()
+        if not text or text == "-":
+            return ""
+
+        # k/m 是英文缩写，mil/mi 是巴西葡萄牙语页面可能使用的千/百万缩写。
+        multiplier = 1
+        suffix_match = re.search(r"\s*(k|mil|m|mi)\s*$", text, flags=re.IGNORECASE)
+        if suffix_match:
+            suffix = suffix_match.group(1).lower()
+            multiplier = 1_000 if suffix in {"k", "mil"} else 1_000_000
+            number_text = text[:suffix_match.start()].strip()
+            number = ShopeeAuto._parse_brazilian_number(number_text)
+            if number is None:
+                return ""
+            return int(round(number * multiplier))
+
+        # 没有单位缩写时，点号和逗号按数量字段的千位分隔符处理。
+        integer_text = re.sub(r"[^0-9-]", "", text)
+        if not integer_text or integer_text == "-":
+            return ""
+        try:
+            return int(integer_text)
+        except ValueError:
+            return ""
 
     @staticmethod
     def _parse_brazilian_number(raw_text: str) -> float | None:
