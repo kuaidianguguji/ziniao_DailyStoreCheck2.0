@@ -1,7 +1,8 @@
 """Mercado Libre（美客多）店铺数据自动化和爬虫。
 
 本文件独立维护美客多的 DrissionPage 连接、XPath、数值解析和飞书字段组装。
-程序只接管紫鸟已经打开的当前标签页，不会主动访问网址。
+程序先接管紫鸟已经打开的当前标签页，确认店铺首页加载完成后，
+再使用同一个标签页进入固定的美客多经营指标页面，不会创建普通浏览器。
 
 下面各指标 XPath 集中维护在本文件中；当前已填写的 XPath 可以直接调整。
 如果某个 XPath 为空、元素不存在或数值解析失败，该指标默认写入空值，其他指标继续执行。
@@ -27,9 +28,9 @@ LOGGER = logging.getLogger(__name__)
 # 美客多首页广告弹窗的关闭按钮。
 HOME_AD_CLOSE_XPATH = '//button[@class="andes-modal__close-button"]'
 
-# 销售量菜单展开按钮和经营指标按钮。
-SALES_SECTION_BUTTON_XPATH = '//input[@id="myml-menu-section-toggle-my_sales"]/ancestor::li[1]//button[@data-section-id="MY_SALES"]//label'
-METRICS_BUTTON_XPATH = '//input[@id="myml-menu-section-toggle-my_sales"]/ancestor::li[1]//div[@data-item-id="MYML_METRICS"]//span'
+# 紫鸟打开并登录美客多店铺后，使用当前标签页直接进入这个经营指标页面。
+# 该页面就是日期切换和数据抓取页面，不再点击“销售量 -> 指标”等菜单按钮。
+METRICS_PAGE_URL = "https://vendedores.mercadolivre.com.br/metricas/negocio/visao-geral#from=seller-menu"
 
 # 页面和按钮操作参数。重试次数 3 表示首次点击失败后再重试 3 次。
 PAGE_READY_TIMEOUT_SECONDS = 60
@@ -139,27 +140,19 @@ class MercadoAuto:
 
         LOGGER.info("[美客多][开始] 店铺=%s，准备接管紫鸟浏览器，debugging_port=%s", store_name, debugging_port)
 
-        # 连接紫鸟已经打开的 Chromium，不创建普通浏览器，也不调用 tab.get()。
+        # 连接紫鸟已经打开的 Chromium，不创建普通浏览器；后续只在这个标签页中打开指标网址。
         browser = Chromium(f"127.0.0.1:{debugging_port}")
         tab = browser.latest_tab
         collected_at = datetime.now(timezone.utc).isoformat()
         feishu_fields: dict[str, Any] = {}
         raw_values: dict[str, str] = {}
 
-        # 先等待首页文档加载完成，再固定等待 10 秒，让广告弹窗和左侧菜单完成渲染。
-        self._wait_for_page_ready(tab, PAGE_READY_TIMEOUT_SECONDS)
-        LOGGER.info("[美客多][页面] 主文档等待结束，额外等待 %s 秒", AFTER_PAGE_READY_WAIT_SECONDS)
-        time.sleep(AFTER_PAGE_READY_WAIT_SECONDS)
+        # 先确认紫鸟打开的美客多初始店铺页已经完整加载，避免登录状态尚未建立就跳转。
+        if not self._wait_for_page_ready(tab, PAGE_READY_TIMEOUT_SECONDS, "紫鸟初始店铺页"):
+            raise TimeoutError("美客多初始店铺页在 60 秒内未加载完成，停止本店铺采集")
 
-        # 首页广告有时不出现；出现时关闭，并等待“指标”或“销售量”菜单可操作。
-        self._close_home_ad(tab)
-
-        # 指标按钮已可见时直接点击；不可见时先展开销售量菜单，再点击指标。
-        next_after_metrics = (
-            self._first_step_xpath(PERIOD_CLICK_STEPS.get("7天", []))
-            or self._first_metric_xpath("7天")
-        )
-        self._enter_metrics_page(tab, next_after_metrics)
+        # 使用当前已登录的紫鸟标签页直接进入经营指标页；新页面必须再次加载完成后才允许操作。
+        self._open_metrics_page(tab)
 
         # 严格按 7 天 -> 读取全部 7 天指标 -> 30 天 -> 读取全部 30 天指标执行。
         for period in ("7天", "30天"):
@@ -222,46 +215,38 @@ class MercadoAuto:
         LOGGER.info("[美客多][完成] 店铺=%s，有效指标=%s/%s", store_name, valid_count, len(feishu_fields))
         return [row]
 
-    def _enter_metrics_page(self, tab: Any, next_xpath: str = "") -> bool:
-        """根据“指标”按钮是否可见，选择直接进入或先展开销售量菜单。"""
-        metrics_element = self._find_visible_element(tab, METRICS_BUTTON_XPATH, timeout=2)
-        if metrics_element:
-            LOGGER.info("[美客多][菜单判断] 指标按钮当前可见，直接点击指标")
-        else:
-            LOGGER.info("[美客多][菜单判断] 指标按钮当前不可见，先点击销售量展开按钮")
-            expanded = self._click_with_retry(tab, SALES_SECTION_BUTTON_XPATH, "点击销售量展开按钮")
-            if not expanded:
-                LOGGER.error("[美客多][菜单失败] 销售量展开按钮连续 4 次点击失败，无法正常展开指标菜单")
-                return False
-            if not self._wait_for_xpath(tab, METRICS_BUTTON_XPATH, NEXT_ELEMENT_TIMEOUT_SECONDS, "销售量展开后的指标按钮"):
-                LOGGER.error("[美客多][菜单失败] 展开销售量后等待 30 秒仍未看到指标按钮")
-                return False
+    def _open_metrics_page(self, tab: Any) -> None:
+        """在紫鸟当前登录标签页打开经营指标网址，并等待页面及日期控件完成渲染。"""
+        LOGGER.info("[美客多][页面跳转] 准备在紫鸟当前标签页打开经营指标页，url=%s", METRICS_PAGE_URL)
+        try:
+            tab.get(METRICS_PAGE_URL)
+        except Exception as exc:
+            LOGGER.error("[美客多][页面跳转失败] 无法打开经营指标页，url=%s，异常=%s", METRICS_PAGE_URL, exc)
+            raise RuntimeError(f"无法打开美客多经营指标页: {exc}") from exc
 
-        entered = self._click_with_retry(tab, METRICS_BUTTON_XPATH, "点击指标按钮")
-        if not entered:
-            LOGGER.error("[美客多][菜单失败] 指标按钮连续 4 次点击失败，后续指标可能全部为空")
-            return False
-        self._wait_for_xpath(tab, next_xpath, NEXT_ELEMENT_TIMEOUT_SECONDS, "指标页面的下一步骤或首个数据")
-        return True
+        if not self._wait_for_page_ready(tab, PAGE_READY_TIMEOUT_SECONDS, "经营指标页"):
+            raise TimeoutError("美客多经营指标页在 60 秒内未加载完成，停止本店铺采集")
+
+        # document.readyState 完成后再等待 10 秒，让前端异步数据、日期控件和广告弹窗完成渲染。
+        LOGGER.info("[美客多][经营指标页] 文档加载完成，额外等待 %s 秒", AFTER_PAGE_READY_WAIT_SECONDS)
+        time.sleep(AFTER_PAGE_READY_WAIT_SECONDS)
+        self._close_home_ad(tab)
+
+        if not self._wait_for_xpath(
+            tab,
+            DATE_SWITCH_BUTTON_XPATH,
+            NEXT_ELEMENT_TIMEOUT_SECONDS,
+            "经营指标页日期切换按钮",
+        ):
+            raise RuntimeError("经营指标页加载后未发现日期切换按钮，停止本店铺采集")
 
     def _close_home_ad(self, tab: Any) -> bool:
-        """关闭首页广告弹窗；弹窗未出现时直接继续，不把它当作错误。"""
+        """关闭经营指标页可能出现的广告弹窗；未出现时直接继续。"""
         if not self._find_visible_element(tab, HOME_AD_CLOSE_XPATH, timeout=1):
-            LOGGER.info("[美客多][首页广告] 等待 10 秒后未发现广告关闭按钮，直接继续")
+            LOGGER.info("[美客多][广告弹窗] 经营指标页额外等待 10 秒后未发现关闭按钮，直接继续")
             return False
-        LOGGER.info("[美客多][首页广告] 发现广告弹窗，准备点击关闭，xpath=%s", HOME_AD_CLOSE_XPATH)
-        closed = self._click_with_retry(tab, HOME_AD_CLOSE_XPATH, "关闭首页广告弹窗")
-        if closed:
-            self._wait_for_any_xpath(
-                tab,
-                (
-                    ("指标按钮", METRICS_BUTTON_XPATH),
-                    ("销售量展开按钮", SALES_SECTION_BUTTON_XPATH),
-                ),
-                NEXT_ELEMENT_TIMEOUT_SECONDS,
-                "广告关闭后的菜单按钮",
-            )
-        return closed
+        LOGGER.info("[美客多][广告弹窗] 发现广告弹窗，准备点击关闭，xpath=%s", HOME_AD_CLOSE_XPATH)
+        return self._click_with_retry(tab, HOME_AD_CLOSE_XPATH, "关闭经营指标页广告弹窗")
 
     def _run_click_steps(self, tab: Any, steps: list[dict[str, Any]], final_next_xpath: str = "") -> None:
         """按顺序点击按钮；每个按钮均重试 3 次，并等待下一元素最多 30 秒。"""
@@ -430,25 +415,29 @@ class MercadoAuto:
             return not visible
         return False
 
-    def _wait_for_page_ready(self, tab: Any, timeout_seconds: float) -> bool:
-        """轮询 document.readyState，最长等待 60 秒让首页文档加载完成。"""
+    def _wait_for_page_ready(self, tab: Any, timeout_seconds: float, page_name: str = "当前页面") -> bool:
+        """轮询 document.readyState，等待指定页面的主文档加载完成。"""
         started_at = time.monotonic()
         deadline = started_at + timeout_seconds
         last_state = ""
-        LOGGER.info("[美客多][页面等待] 等待 document.readyState=complete，最长 %.1f 秒", timeout_seconds)
+        LOGGER.info(
+            "[美客多][页面等待] 页面=%s，等待 document.readyState=complete，最长 %.1f 秒",
+            page_name,
+            timeout_seconds,
+        )
         while time.monotonic() < deadline:
             try:
                 state = str(tab.run_js("return document.readyState;") or "").lower()
                 if state != last_state:
-                    LOGGER.info("[美客多][页面状态] document.readyState=%s", state)
+                    LOGGER.info("[美客多][页面状态] 页面=%s，document.readyState=%s", page_name, state)
                     last_state = state
                 if state == "complete":
-                    LOGGER.info("[美客多][页面成功] 首页文档加载完成，耗时 %.2f 秒", time.monotonic() - started_at)
+                    LOGGER.info("[美客多][页面成功] 页面=%s，主文档加载完成，耗时 %.2f 秒", page_name, time.monotonic() - started_at)
                     return True
             except Exception as exc:
-                LOGGER.warning("[美客多][页面异常] 读取 document.readyState 失败：%s", exc)
+                LOGGER.warning("[美客多][页面异常] 页面=%s，读取 document.readyState 失败：%s", page_name, exc)
             time.sleep(1)
-        LOGGER.error("[美客多][页面超时] 等待 %.1f 秒仍未加载完成，继续执行", timeout_seconds)
+        LOGGER.error("[美客多][页面超时] 页面=%s，等待 %.1f 秒仍未加载完成", page_name, timeout_seconds)
         return False
 
     def _wait_for_xpath(self, tab: Any, xpath: str, timeout_seconds: float, target_name: str) -> bool:
@@ -467,26 +456,6 @@ class MercadoAuto:
             time.sleep(1)
         LOGGER.error("[美客多][元素超时] 目标=%s，等待 %.1f 秒仍未出现，xpath=%s", target_name, timeout_seconds, xpath)
         return False
-
-    def _wait_for_any_xpath(
-        self,
-        tab: Any,
-        targets: tuple[tuple[str, str], ...],
-        timeout_seconds: float,
-        target_group_name: str,
-    ) -> str:
-        """等待多个候选元素中的任意一个出现，返回实际出现元素的名称。"""
-        started_at = time.monotonic()
-        deadline = started_at + timeout_seconds
-        LOGGER.info("[美客多][元素等待] 目标=%s，最长等待 %.1f 秒", target_group_name, timeout_seconds)
-        while time.monotonic() < deadline:
-            for target_name, xpath in targets:
-                if xpath and self._find_visible_element(tab, xpath, timeout=0.5):
-                    LOGGER.info("[美客多][元素出现] 目标=%s，实际出现=%s，耗时 %.2f 秒", target_group_name, target_name, time.monotonic() - started_at)
-                    return target_name
-            time.sleep(1)
-        LOGGER.error("[美客多][元素超时] 目标=%s，等待 %.1f 秒仍无候选元素出现", target_group_name, timeout_seconds)
-        return ""
 
     @staticmethod
     def _find_visible_element(tab: Any, xpath: str, timeout: float = 1) -> Any:
@@ -521,11 +490,6 @@ class MercadoAuto:
             if xpath:
                 return xpath
         return ""
-
-    @staticmethod
-    def _first_step_xpath(steps: list[dict[str, Any]]) -> str:
-        """返回一组按钮步骤中的第一个非空 XPath。"""
-        return MercadoAuto._next_step_xpath(steps, 0)
 
     @staticmethod
     def _first_metric_xpath(period: str) -> str:
