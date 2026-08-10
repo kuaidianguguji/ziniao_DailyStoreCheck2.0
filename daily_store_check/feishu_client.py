@@ -370,23 +370,15 @@ class FeishuClient:
 
     def send_robot_message(self, recipient: str, title: str, content: str) -> None:
         """优先按 robot.receive_id_type 使用应用机器人定向推送，否则使用 webhook。"""
-        message_card = self._build_message_card(title, content)
         recipients = [item.strip() for item in recipient.split(",") if item.strip()]
         if recipients and self.config.get("app_id") and self.config.get("app_secret"):
             receive_id_type = self.config.get("robot", {}).get("receive_id_type", "open_id")
             for receive_id in recipients:
-                if message_card:
-                    request_body = {
-                        "receive_id": receive_id,
-                        "msg_type": "interactive",
-                        "content": json.dumps(message_card, ensure_ascii=False),
-                    }
-                else:
-                    request_body = {
-                        "receive_id": receive_id,
-                        "msg_type": "text",
-                        "content": json.dumps({"text": f"{title}\n{content}"}, ensure_ascii=False),
-                    }
+                request_body = {
+                    "receive_id": receive_id,
+                    "msg_type": "text",
+                    "content": json.dumps({"text": f"{title}\n{content}"}, ensure_ascii=False),
+                }
                 LOGGER.info(
                     "[飞书][应用机器人JSON] receive_id_type=%s，body=%s",
                     receive_id_type,
@@ -404,10 +396,7 @@ class FeishuClient:
         if not webhook:
             LOGGER.warning("飞书机器人 webhook 未配置，跳过推送 recipient=%s", recipient)
             return
-        if message_card:
-            body: dict[str, Any] = {"msg_type": "interactive", "card": message_card}
-        else:
-            body = {"msg_type": "text", "content": {"text": f"{title}\n{content}"}}
+        body: dict[str, Any] = {"msg_type": "text", "content": {"text": f"{title}\n{content}"}}
         secret = self.config.get("robot", {}).get("sign_secret", "")
         if secret:
             timestamp = str(int(time.time()))
@@ -421,37 +410,6 @@ class FeishuClient:
             LOGGER.error("[飞书][Webhook机器人失败] response=%s", self._json_for_log(result))
             raise RuntimeError(f"飞书机器人推送失败: {result}")
         LOGGER.info("[飞书][Webhook机器人成功] response=%s", self._json_for_log(result))
-
-    def _build_message_card(self, title: str, content: str) -> dict[str, Any]:
-        """把标题和正文放入飞书消息卡片模板的 Markdown 文本变量。"""
-        card_config = self.config.get("robot", {}).get("message_card", {})
-        if not isinstance(card_config, dict):
-            LOGGER.warning("[飞书][消息卡片] message_card 配置格式错误，回退为普通文本消息")
-            return {}
-
-        template_id = str(card_config.get("template_id", "")).strip()
-        if not template_id:
-            LOGGER.warning("[飞书][消息卡片] template_id 未配置，回退为普通文本消息")
-            return {}
-
-        variable_name = str(card_config.get("variable_name", "info")).strip() or "info"
-        markdown_text = f"**{title}**\n\n{content}"
-        template_data: dict[str, Any] = {
-            "template_id": template_id,
-            "template_variable": {variable_name: markdown_text},
-        }
-        template_version_name = str(card_config.get("template_version_name", "")).strip()
-        if template_version_name:
-            template_data["template_version_name"] = template_version_name
-
-        card = {"type": "template", "data": template_data}
-        LOGGER.info(
-            "[飞书][消息卡片Markdown] 变量名=%s，Markdown=%s，card=%s",
-            variable_name,
-            self._json_for_log(markdown_text),
-            self._json_for_log(card),
-        )
-        return card
 
     @staticmethod
     def _sign(timestamp: str, secret: str) -> str:
