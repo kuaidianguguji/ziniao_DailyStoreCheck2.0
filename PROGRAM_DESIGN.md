@@ -73,7 +73,7 @@ ziniao_DailyStoreCheck_codex_two/
 - `batch_create_records`：每 500 条分批写入数据多维表。
 - `remove_old_records`：按采集时间计算 90 天截止线并批量删除过期记录。
 - `append_spreadsheet_rows`：向历史电子表追加二维数组。
-- `send_robot_message`：优先应用机器人按 `receive_id_type` 定向发送；webhook 只作为固定群机器人兜底。
+- `send_robot_message`：优先应用机器人按 `receive_id_type` 定向发送；webhook 只作为固定群机器人兜底。配置 `feishu.robot.message_card.template_id` 后，标题和正文会放入模板的 `info`（可配置）变量并作为 Markdown 富文本卡片发送；未配置模板 ID 时回退为普通文本消息。
 - `configured`：凭据是否齐全；不齐全时读写接口进入 dry-run 并记录日志。
 
 ### `daily_store_check/ziniao_client.py`
@@ -170,9 +170,10 @@ feishu:
 3. 控制台“推送人员”必须使用飞书“人员”字段。接口会从人员字段返回值中读取 `open_id`/`user_id`，不会把姓名文本猜成用户 ID。
 4. 控制台店铺名必须与紫鸟 `browserName` 完全一致。
 5. 当前 `robot.receive_id_type` 为 `open_id`；最终汇总接收人在 `robot.summary_recipients` 中按 `姓名: ou_xxx` 填写。字典为空时不发送 DeepSeek 分析结果。
-6. TikTok、Shopee、美客多短期表分别严格使用项目定义的 33、26、32 个字段；不要再为 Shopee 创建通用的“指标/数值/原始数据”字段。
-7. 多维表“采集时间”使用日期字段，程序写入前统一转换为毫秒时间戳。
-8. 三张历史电子表第一行应分别按 `TIKTOK_TABLE_FIELD_ORDER`、`SHOPEE_TABLE_FIELD_ORDER`、`MERCADO_TABLE_FIELD_ORDER` 建立 33、26、32 列。
+6. 如使用富文本机器人消息，在飞书消息卡片搭建工具中发布模板，在 Markdown 组件中引用 `${info}`，再将模板 ID 填入 `feishu.robot.message_card.template_id`；变量名默认是 `info`，必须与模板一致。应用机器人发送卡片时使用 `msg_type=interactive`，Webhook 使用 `msg_type=interactive` 和 `card` 字段。
+7. TikTok、Shopee、美客多短期表分别严格使用项目定义的 33、26、32 个字段；不要再为 Shopee 创建通用的“指标/数值/原始数据”字段。
+8. 多维表“采集时间”使用日期字段，程序写入前统一转换为毫秒时间戳。
+9. 三张历史电子表第一行应分别按 `TIKTOK_TABLE_FIELD_ORDER`、`SHOPEE_TABLE_FIELD_ORDER`、`MERCADO_TABLE_FIELD_ORDER` 建立 33、26、32 列。
 
 ## 6. 启动方式
 

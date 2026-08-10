@@ -70,6 +70,14 @@ feishu:
     # 姓名只用于方便识别接收人；全部店铺结束后会向每个 open_id 发送 DeepSeek 分析结果。
     summary_recipients: {}
     # 填写示例：summary_recipients: {"张三": "ou_xxxxxxxxxxxxx", "李四": "ou_yyyyyyyyyyyyy"}
+    # 飞书消息卡片模板配置；模板中的 Markdown 组件应使用 ${info} 变量。
+    message_card:
+      # 在飞书消息卡片搭建工具发布模板后复制这里的模板 ID。
+      template_id: ""
+      # 可选：留空时使用模板当前发布版本。
+      template_version_name: ""
+      # 用户已配置的文本变量名。
+      variable_name: "info"
     webhook_url: ""
     sign_secret: ""
 
