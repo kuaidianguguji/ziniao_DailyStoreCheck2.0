@@ -23,17 +23,36 @@ from DrissionPage import Chromium
 LOGGER = logging.getLogger(__name__)
 
 
+# TikTok 登录入口和登录后的状态标记。
+# 页面就绪后先处理登录，登录阶段不关闭弹窗或验证码，确保登录流程优先级最高。
+LOGIN_EMAIL_PANEL_BUTTON_XPATH = '//span[@id="TikTok_Ads_SSO_Login_Email_Panel_Button"]'
+LOGIN_EMAIL_SELECTED_XPATH = (
+    '//span[@id="TikTok_Ads_SSO_Login_Email_Panel_Button" '
+    'and contains(@class,"panel-item") and contains(@class,"selected")]'
+)
+LOGIN_BUTTON_XPATH = '//button[@id="TikTok_Ads_SSO_Login_Btn"]'
+
 # 首页弹窗和滑块验证码的关闭按钮。
-# 验证码可能在任意阶段出现，因此点击、等待和读取指标前都会检查一次。
+# 登录流程结束后，验证码可能在任意阶段出现，因此点击、等待和读取指标前都会检查一次。
 HOME_DIALOG_CLOSE_XPATH = '//div[@role="dialog"]//span[contains(@class,"core-modal-close-icon")]'
 VERIFY_BAR_CLOSE_XPATH = '//a[@id="verify-bar-close"]'
 
 # 页面加载和按钮操作参数。重试次数 3 表示“首次点击失败后再重试 3 次”。
 PAGE_READY_TIMEOUT_SECONDS = 60
 AFTER_PAGE_READY_WAIT_SECONDS = 10
+# 登录入口必须连续可见 5 秒，才判定当前店铺未登录；最多观察 10 秒，避免动态页面无限等待。
+LOGIN_PANEL_STABLE_SECONDS = 5
+LOGIN_DETECTION_TIMEOUT_SECONDS = 10
 CLICK_RETRY_TIMES = 3
 CLICK_RETRY_INTERVAL_SECONDS = 2
 NEXT_ELEMENT_TIMEOUT_SECONDS = 30
+
+# 任意两个真实按钮点击之间保持随机间隔，避免登录、菜单和日期按钮连续点击过快。
+# 点击前还会把元素滚动到视口中间、移动鼠标到目标并短暂停留，尽量模拟人工操作。
+HUMAN_CLICK_INTERVAL_MIN_SECONDS = 2.5
+HUMAN_CLICK_INTERVAL_MAX_SECONDS = 4.5
+HUMAN_PRE_CLICK_PAUSE_MIN_SECONDS = 0.5
+HUMAN_PRE_CLICK_PAUSE_MAX_SECONDS = 1.2
 
 # 广告日期切换后，最长等待 30 秒确认五个广告指标均已加载且数值保持稳定。
 # 连续两次读取结果一致，才认为本轮异步数据渲染已经结束。
@@ -207,11 +226,16 @@ class TiktokAuto:
     def __init__(self, config: dict[str, Any] | None = None):
         """保存 TikTok 独立配置；按钮和指标 XPath 直接维护在本文件顶部。"""
         self.config = config or {}
+        # 记录最近一次真实点击的时间；后续每次点击都会据此补足随机的人类操作间隔。
+        self._last_button_click_at: float | None = None
 
     def collect(self, store_name: str, download_path: str = "", debugging_port: int | str | None = None) -> list[dict[str, Any]]:
         """接管紫鸟当前标签页，依次采集广告数据和数据分析概览。"""
         if not debugging_port:
             raise RuntimeError("紫鸟没有返回 debuggingPort，无法接管 TikTok 店铺")
+
+        # 每间店铺重新计算点击节奏，避免上一间店铺的关闭时间影响当前店铺。
+        self._last_button_click_at = None
 
         LOGGER.info("[TikTok][开始] 店铺=%s，准备接管紫鸟浏览器，debugging_port=%s", store_name, debugging_port)
 
@@ -221,10 +245,18 @@ class TiktokAuto:
         collected_at = datetime.now(timezone.utc).isoformat()
         LOGGER.info("[TikTok][浏览器] 店铺=%s，已取得紫鸟当前标签页", store_name)
 
-        # 等待紫鸟当前页面完全加载，再额外等待 10 秒；等待期间穿插鼠标移动和弹窗检查。
-        self._wait_for_page_ready(tab, PAGE_READY_TIMEOUT_SECONDS)
+        # 登录检测的优先级高于弹窗和验证码处理，但必须等紫鸟当前页面主文档先加载完成。
+        # 初次页面就绪等待期间不处理任何弹窗，避免在判断登录状态前执行其他页面操作。
+        if not self._wait_for_page_ready(tab, PAGE_READY_TIMEOUT_SECONDS, check_interruptions=False):
+            raise TimeoutError("TikTok 初始页面在规定时间内没有加载完成，无法安全检查登录状态")
+
+        login_required = self._is_login_required(tab)
+        if login_required:
+            self._perform_email_login(tab)
+
+        # 已登录或刚刚完成登录后，再额外等待 10 秒，让菜单、动态数据和弹窗完成渲染。
         LOGGER.info(
-            "[TikTok][页面] 主文档等待结束，开始额外等待 %s 秒；期间执行鼠标移动并检查弹窗",
+            "[TikTok][页面] 登录状态检查结束，开始额外等待 %s 秒；期间执行鼠标移动并检查弹窗",
             AFTER_PAGE_READY_WAIT_SECONDS,
         )
         self._human_wait(tab, AFTER_PAGE_READY_WAIT_SECONDS, check_interruptions=True)
@@ -549,6 +581,171 @@ class TiktokAuto:
             if bool(ratio_spec.get("remove_amount")):
                 field_values.pop(amount_field, None)
 
+    def _is_login_required(self, tab: Any) -> bool:
+        """页面就绪后优先观察登录入口；连续可见满 5 秒才确认未登录。"""
+        started_at = time.monotonic()
+        deadline = started_at + LOGIN_DETECTION_TIMEOUT_SECONDS
+        continuously_visible_since: float | None = None
+        LOGGER.info(
+            "[TikTok][登录检测] 开始检查邮箱登录入口，连续可见 %.1f 秒才判定未登录，最长观察 %.1f 秒，xpath=%s",
+            LOGIN_PANEL_STABLE_SECONDS,
+            LOGIN_DETECTION_TIMEOUT_SECONDS,
+            LOGIN_EMAIL_PANEL_BUTTON_XPATH,
+        )
+
+        while time.monotonic() < deadline:
+            login_entry = self._find_visible_element(tab, LOGIN_EMAIL_PANEL_BUTTON_XPATH, timeout=0.5)
+            now = time.monotonic()
+            if login_entry:
+                if continuously_visible_since is None:
+                    continuously_visible_since = now
+                    LOGGER.warning("[TikTok][登录检测] 发现邮箱登录入口，开始连续计时")
+                visible_seconds = now - continuously_visible_since
+                if visible_seconds >= LOGIN_PANEL_STABLE_SECONDS:
+                    LOGGER.warning(
+                        "[TikTok][登录检测] 邮箱登录入口已连续可见 %.2f 秒，确认当前店铺未登录",
+                        visible_seconds,
+                    )
+                    return True
+            else:
+                if continuously_visible_since is not None:
+                    LOGGER.info(
+                        "[TikTok][登录检测] 登录入口连续出现 %.2f 秒后消失，未达到 %.1f 秒，重新计时",
+                        now - continuously_visible_since,
+                        LOGIN_PANEL_STABLE_SECONDS,
+                    )
+                continuously_visible_since = None
+
+            # 登录判断完成前只移动鼠标，不允许关闭验证码或首页弹窗。
+            self._human_wait(tab, 0.5, check_interruptions=False)
+
+        LOGGER.info(
+            "[TikTok][登录检测] 观察 %.2f 秒未发现连续可见满 %.1f 秒的登录入口，按已登录状态继续",
+            time.monotonic() - started_at,
+            LOGIN_PANEL_STABLE_SECONDS,
+        )
+        return False
+
+    def _perform_email_login(self, tab: Any) -> None:
+        """切换邮箱登录、点击登录，并在不处理其他弹窗的前提下等待登录后页面就绪。"""
+        LOGGER.warning("[TikTok][登录流程] 开始处理 TikTok 邮箱登录，登录完成前暂停其他弹窗检测")
+
+        email_mode_ready = self._click_with_retry(
+            tab,
+            LOGIN_EMAIL_PANEL_BUTTON_XPATH,
+            "登录-点击使用邮箱登录",
+            success_xpath=LOGIN_EMAIL_SELECTED_XPATH,
+            success_state="visible",
+            success_name="邮箱登录入口已经切换为 selected 状态",
+            check_interruptions=False,
+        )
+        if not email_mode_ready:
+            raise RuntimeError("TikTok 未登录，但无法切换到邮箱登录状态")
+
+        login_clicked = self._click_with_retry(
+            tab,
+            LOGIN_BUTTON_XPATH,
+            "登录-点击登录按钮",
+            check_interruptions=False,
+        )
+        if not login_clicked:
+            raise RuntimeError("TikTok 已切换到邮箱登录状态，但登录按钮点击失败")
+
+        LOGGER.info("[TikTok][登录流程] 登录按钮已点击，等待登录面板消失并进入店铺网页")
+        entered_page = self._wait_for_element_state(
+            tab,
+            LOGIN_EMAIL_PANEL_BUTTON_XPATH,
+            "hidden",
+            PAGE_READY_TIMEOUT_SECONDS,
+            "TikTok 登录面板",
+            check_interruptions=False,
+        )
+        if not entered_page:
+            raise TimeoutError("点击 TikTok 登录按钮后，登录面板在规定时间内没有消失")
+
+        LOGGER.info("[TikTok][登录流程] 登录面板已消失，开始等待登录后的网页加载完成")
+        if not self._wait_for_page_ready(tab, PAGE_READY_TIMEOUT_SECONDS, check_interruptions=False):
+            raise TimeoutError("TikTok 登录面板已消失，但登录后的网页在规定时间内没有加载完成")
+        LOGGER.info("[TikTok][登录成功] 已进入 TikTok 店铺网页并确认主文档加载完成")
+
+    def _prepare_human_click(self, tab: Any, element: Any, step_name: str) -> None:
+        """在真实点击前补足随机间隔，并执行居中滚动、鼠标移动和短暂停留。"""
+        target_interval = random.uniform(HUMAN_CLICK_INTERVAL_MIN_SECONDS, HUMAN_CLICK_INTERVAL_MAX_SECONDS)
+        if self._last_button_click_at is None:
+            # 第一个按钮前也稍作停留，避免页面刚加载完就立即发生机械点击。
+            first_pause = random.uniform(HUMAN_PRE_CLICK_PAUSE_MIN_SECONDS, HUMAN_PRE_CLICK_PAUSE_MAX_SECONDS)
+            LOGGER.info(
+                "[TikTok][仿人点击准备] 步骤=%s，当前是本店铺首次点击，先观察页面 %.2f 秒",
+                step_name,
+                first_pause,
+            )
+            self._human_wait(tab, first_pause, check_interruptions=False)
+        else:
+            elapsed = time.monotonic() - self._last_button_click_at
+            remaining = max(0.0, target_interval - elapsed)
+            if remaining > 0:
+                LOGGER.info(
+                    "[TikTok][仿人点击间隔] 步骤=%s，距上次点击 %.2f 秒，随机目标 %.2f 秒，继续等待 %.2f 秒",
+                    step_name,
+                    elapsed,
+                    target_interval,
+                    remaining,
+                )
+                self._human_wait(tab, remaining, check_interruptions=False)
+            else:
+                LOGGER.info(
+                    "[TikTok][仿人点击间隔] 步骤=%s，距上次点击 %.2f 秒，已达到随机目标 %.2f 秒",
+                    step_name,
+                    elapsed,
+                    target_interval,
+                )
+
+        scrolled = False
+        try:
+            scroll = getattr(element, "scroll", None)
+            to_see = getattr(scroll, "to_see", None) if scroll is not None else None
+            if callable(to_see):
+                to_see(center=True)
+                scrolled = True
+        except Exception as exc:
+            LOGGER.debug("[TikTok][仿人滚动] 步骤=%s，DrissionPage 居中滚动失败=%s", step_name, exc)
+        if not scrolled:
+            try:
+                element.run_js("this.scrollIntoView({behavior:'smooth', block:'center', inline:'center'});")
+                scrolled = True
+            except Exception as exc:
+                LOGGER.debug("[TikTok][仿人滚动] 步骤=%s，JavaScript 居中滚动失败=%s", step_name, exc)
+        LOGGER.info("[TikTok][仿人滚动] 步骤=%s，滚动到按钮附近结果=%s", step_name, "成功" if scrolled else "跳过")
+
+        scroll_pause = random.uniform(HUMAN_PRE_CLICK_PAUSE_MIN_SECONDS, HUMAN_PRE_CLICK_PAUSE_MAX_SECONDS)
+        self._human_wait(tab, scroll_pause, check_interruptions=False)
+        moved_to_target = self._human_mouse_move_to_element(tab, element)
+        hover_pause = random.uniform(0.3, 0.8)
+        LOGGER.info(
+            "[TikTok][仿人鼠标] 步骤=%s，移动到目标结果=%s，点击前停留 %.2f 秒",
+            step_name,
+            "成功" if moved_to_target else "使用随机移动代替",
+            hover_pause,
+        )
+        # 此处直接停留，不再调用会随机移动鼠标的 _human_wait，确保光标停在目标附近再点击。
+        time.sleep(hover_pause)
+
+    @staticmethod
+    def _human_mouse_move_to_element(tab: Any, element: Any) -> bool:
+        """把鼠标平滑移动到目标元素；失败时保留原有随机移动作为后备。"""
+        try:
+            from DrissionPage import Actions
+
+            Actions(tab).move_to(element, duration=random.uniform(0.4, 0.9))
+            return True
+        except Exception:
+            TiktokAuto._human_mouse_move(tab)
+            return False
+
+    def _record_button_click(self) -> None:
+        """记录真实点击完成时间，供下一个按钮计算最小随机间隔。"""
+        self._last_button_click_at = time.monotonic()
+
     def _run_click_steps(self, tab: Any, steps: list[dict[str, Any]], final_next_xpath: str = "") -> bool:
         """按顺序点击按钮；点击后的目标状态也必须满足，才把该步骤判定为成功。"""
         all_steps_succeeded = True
@@ -601,8 +798,9 @@ class TiktokAuto:
         success_xpath: str = "",
         success_state: str = "",
         success_name: str = "点击后的页面状态",
+        check_interruptions: bool = True,
     ) -> bool:
-        """按钮最多点击 4 次；DOM 点击成功且预期页面状态满足，才返回成功。"""
+        """按钮最多点击 4 次；可在最高优先级的登录流程中暂停其他弹窗处理。"""
         max_attempts = CLICK_RETRY_TIMES + 1
         for attempt in range(max_attempts):
             # 对“展开菜单、打开面板”类步骤，目标元素已经可见就说明当前状态正确，不应再次点击把它关闭。
@@ -625,9 +823,10 @@ class TiktokAuto:
                     interval,
                     xpath,
                 )
-                self._human_wait(tab, interval, check_interruptions=True)
+                self._human_wait(tab, interval, check_interruptions=check_interruptions)
 
-            self._close_interruptions(tab)
+            if check_interruptions:
+                self._close_interruptions(tab)
             try:
                 LOGGER.info(
                     "[TikTok][按钮查找] 步骤=%s，第 %s/%s 次尝试，xpath=%s",
@@ -645,9 +844,11 @@ class TiktokAuto:
                         max_attempts,
                     )
                     continue
-                self._human_mouse_move(tab)
+                self._prepare_human_click(tab, element, step_name)
                 element.click()
-                self._close_interruptions(tab)
+                self._record_button_click()
+                if check_interruptions:
+                    self._close_interruptions(tab)
 
                 if success_xpath and success_state:
                     LOGGER.info("[TikTok][按钮已点击] 步骤=%s，开始验证=%s", step_name, success_name)
@@ -657,6 +858,7 @@ class TiktokAuto:
                         success_state,
                         NEXT_ELEMENT_TIMEOUT_SECONDS,
                         success_name,
+                        check_interruptions=check_interruptions,
                     )
                     if not verified:
                         LOGGER.warning(
@@ -695,6 +897,7 @@ class TiktokAuto:
         expected_state: str,
         timeout_seconds: float,
         target_name: str,
+        check_interruptions: bool = True,
     ) -> bool:
         """等待按钮或面板出现/消失；消失连续确认两次，避免瞬时查询失败造成误判。"""
         if expected_state not in {"visible", "hidden"}:
@@ -712,7 +915,8 @@ class TiktokAuto:
             xpath,
         )
         while time.monotonic() < deadline:
-            self._close_interruptions(tab)
+            if check_interruptions:
+                self._close_interruptions(tab)
             visible = bool(self._find_visible_element(tab, xpath, timeout=1))
             if expected_state == "visible" and visible:
                 LOGGER.info("[TikTok][状态满足] 目标=%s 已出现，耗时 %.2f 秒", target_name, time.monotonic() - started_at)
@@ -725,7 +929,7 @@ class TiktokAuto:
                     if hidden_checks >= 2:
                         LOGGER.info("[TikTok][状态满足] 目标=%s 连续两次不可见，确认已经消失", target_name)
                         return True
-            self._human_wait(tab, 0.5, check_interruptions=True)
+            self._human_wait(tab, 0.5, check_interruptions=check_interruptions)
 
         LOGGER.error(
             "[TikTok][状态等待超时] 目标=%s，等待 %.1f 秒仍未达到=%s，xpath=%s",
@@ -771,14 +975,20 @@ class TiktokAuto:
         except Exception:
             return None
 
-    def _wait_for_page_ready(self, tab: Any, timeout_seconds: float) -> bool:
-        """轮询 document.readyState，等待网站主文档加载完成。"""
+    def _wait_for_page_ready(
+        self,
+        tab: Any,
+        timeout_seconds: float,
+        check_interruptions: bool = True,
+    ) -> bool:
+        """轮询 document.readyState；登录检查前可禁止处理弹窗和验证码。"""
         started_at = time.monotonic()
         deadline = time.monotonic() + timeout_seconds
         last_ready_state = ""
         LOGGER.info("[TikTok][页面等待] 开始等待 document.readyState=complete，最长 %.1f 秒", timeout_seconds)
         while time.monotonic() < deadline:
-            self._close_interruptions(tab)
+            if check_interruptions:
+                self._close_interruptions(tab)
             try:
                 ready_state = tab.run_js("return document.readyState;")
                 ready_state_text = str(ready_state).lower()
@@ -790,8 +1000,8 @@ class TiktokAuto:
                     return True
             except Exception as exc:
                 LOGGER.warning("[TikTok][页面异常] 读取 document.readyState 失败：%s", exc)
-            self._human_wait(tab, 1, check_interruptions=True)
-        LOGGER.error("[TikTok][页面超时] 等待 %.1f 秒后仍未检测到 document.readyState=complete，继续执行", timeout_seconds)
+            self._human_wait(tab, 1, check_interruptions=check_interruptions)
+        LOGGER.error("[TikTok][页面超时] 等待 %.1f 秒后仍未检测到 document.readyState=complete", timeout_seconds)
         return False
 
     def _wait_for_xpath(self, tab: Any, xpath: str, timeout_seconds: float, target_name: str = "下一元素") -> bool:
@@ -879,8 +1089,9 @@ class TiktokAuto:
                     if not detected:
                         LOGGER.warning("[TikTok][发现干扰] 检测到%s，xpath=%s", interruption_name, xpath)
                         detected = True
-                    self._human_mouse_move(tab)
+                    self._prepare_human_click(tab, element, f"关闭{interruption_name}")
                     element.click()
+                    self._record_button_click()
                     time.sleep(0.5)
                     LOGGER.info(
                         "[TikTok][干扰关闭成功] %s，第 %s/%s 次点击成功",
