@@ -27,6 +27,9 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
     feishu = config.setdefault("feishu", {})
     feishu["app_id"] = os.getenv("FEISHU_APP_ID", feishu.get("app_id", ""))
     feishu["app_secret"] = os.getenv("FEISHU_APP_SECRET", feishu.get("app_secret", ""))
+    deepseek = config.setdefault("deepseek", {})
+    # API Key 既可以直接填写在 config.yaml，也可以在部署环境中用 DEEPSEEK_API_KEY 覆盖。
+    deepseek["api_key"] = os.getenv("DEEPSEEK_API_KEY", deepseek.get("api_key", ""))
     ziniao = config.setdefault("ziniao", {})
     user_info = ziniao.setdefault("user_info", {})
     for key, env_name in (("company", "ZINIAO_COMPANY"), ("username", "ZINIAO_USERNAME"), ("password", "ZINIAO_PASSWORD")):
@@ -69,4 +72,3 @@ class StoreTask:
     browser_oauth: str = ""
     browser_id: str = ""
     source_record_id: str = ""
-

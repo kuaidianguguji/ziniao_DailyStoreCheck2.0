@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import StoreTask
+from .deepseek_client import DeepSeekClient
 from .feishu_client import FeishuClient
 from .ziniao_client import ZiniaoClient, ZiniaoStoreCloseError, ZiniaoStoreSession
 
@@ -160,6 +161,7 @@ class DailyStoreCheck:
         """创建飞书和紫鸟客户端，并准备当前轮次的店铺缓存。"""
         self.config = config
         self.feishu = FeishuClient(config)
+        self.deepseek = DeepSeekClient(config)
         self.ziniao = ZiniaoClient(config)
         self.browser_list: list[dict[str, Any]] = []
 
@@ -315,25 +317,40 @@ class DailyStoreCheck:
         return collected_at, metric_values
 
     def _send_all_info_summary(self, ALL_info: list[dict[str, Any]]) -> None:
-        """全部店铺完成后，按姓名 -> open_id 字典发送 ALL_info 最终汇总。"""
-        recipients = self.feishu.get_summary_recipients()
-        if not recipients:
-            LOGGER.info("[飞书][ALL_info汇总] summary_recipients 为空，不发送最终全店铺汇总")
-            return
+        """把非空 ALL_info 交给 DeepSeek 分析，再把返回文本发送给全部汇总接收人。"""
         if not ALL_info:
-            LOGGER.info("[飞书][ALL_info汇总] 本轮没有店铺结果，不发送最终全店铺汇总")
+            LOGGER.info("[DeepSeek][ALL_info汇总] 本轮没有店铺结果，不调用 DeepSeek")
             return
 
-        summary_text = json.dumps(ALL_info, ensure_ascii=False, indent=2, default=str)
         LOGGER.info(
-            "[飞书][ALL_info打包] 店铺数=%s，接收人数=%s，ALL_info=%s",
+            "[DeepSeek][ALL_info汇总] 准备分析本轮全部店铺，店铺数=%s，ALL_info=%s",
             len(ALL_info),
-            len(recipients),
             json.dumps(ALL_info, ensure_ascii=False, default=str),
         )
+        try:
+            analysis_text = self.deepseek.analyze_all_info(ALL_info)
+        except Exception:
+            # AI 汇总属于最终附加步骤，失败不能影响已完成的数据写入、紫鸟退出和计时输出。
+            LOGGER.exception("[DeepSeek][ALL_info分析失败] 本轮不发送 AI 汇总")
+            return
+        if not analysis_text:
+            LOGGER.warning("[DeepSeek][ALL_info汇总跳过] 未获得有效分析文本，不发送最终汇总")
+            return
+
+        recipients = self.feishu.get_summary_recipients()
+        if not recipients:
+            LOGGER.info("[飞书][DeepSeek汇总] summary_recipients 为空，分析完成但没有接收人")
+            return
+
+        LOGGER.info(
+            "[飞书][DeepSeek汇总准备] 接收人数=%s，分析字符数=%s，分析内容=%r",
+            len(recipients),
+            len(analysis_text),
+            analysis_text,
+        )
         for recipient_name, receive_id in recipients.items():
-            LOGGER.info("[飞书][ALL_info发送] 接收人姓名=%s，准备发送全部店铺汇总", recipient_name)
-            self._safe_notify(receive_id, "全部平台全部店铺数据汇总", summary_text)
+            LOGGER.info("[飞书][DeepSeek汇总发送] 接收人姓名=%s，准备发送 AI 店铺分析", recipient_name)
+            self._safe_notify(receive_id, "DeepSeek全部店铺数据分析", analysis_text)
 
     def _safe_notify(self, recipient: str, title: str, content: str) -> None:
         """推送失败只记录日志，不影响关闭店铺和后续店铺。"""

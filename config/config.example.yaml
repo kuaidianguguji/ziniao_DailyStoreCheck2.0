@@ -67,11 +67,25 @@ feishu:
   robot:
     # 当前使用 open_id 定向发送，因此下面字典的值填写以 ou_ 开头的 open_id。
     receive_id_type: "open_id"
-    # 姓名只用于方便识别接收人；字典非空时，全部店铺结束后会向每个 open_id 发送 ALL_info 汇总。
+    # 姓名只用于方便识别接收人；全部店铺结束后会向每个 open_id 发送 DeepSeek 分析结果。
     summary_recipients: {}
     # 填写示例：summary_recipients: {"张三": "ou_xxxxxxxxxxxxx", "李四": "ou_yyyyyyyyyyyyy"}
     webhook_url: ""
     sign_secret: ""
+
+# DeepSeek 在全部店铺处理完成后分析 ALL_info，并把返回内容推送给 summary_recipients。
+deepseek:
+  enabled: true
+  # 可直接填写，也可通过环境变量 DEEPSEEK_API_KEY 注入。
+  api_key: ""
+  model_name: "deepseek-v4-flash"
+  base_url: "https://api.deepseek.com/v1"
+  temperature: 0.7
+  max_tokens: 2000
+  timeout_seconds: 120
+  system_prompt: |
+    你是中国一个专业南美跨境电商公司总经理，擅长店铺的数据分析。严格按照用户要求处理输入文本。
+    输出尽量简洁，不要多余废话。这分别是 TikTok、Shopee、美客多巴西跨境电商后台的广告数据和店铺概览数据，帮我总结分析这些店铺。
 
 data:
   retention_days: 90

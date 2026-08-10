@@ -14,6 +14,7 @@ ziniao_DailyStoreCheck_codex_two/
 ├─ config/config.yaml                  # 本机运行配置，已被 Git 忽略
 ├─ daily_store_check/
 │  ├─ config.py                        # 配置加载、平台名标准化、开关判断、StoreTask
+│  ├─ deepseek_client.py               # ALL_info 的 DeepSeek 请求和响应解析
 │  ├─ feishu_client.py                 # 飞书 token、多维表、电子表、机器人
 │  ├─ ziniao_client.py                 # 紫鸟 IPC、店铺开关、WebDriver 会话
 │  └─ orchestrator.py                  # 串行业务流程和平台爬虫注册
@@ -36,7 +37,7 @@ ziniao_DailyStoreCheck_codex_two/
 7. 爬虫优先用 DrissionPage 连接紫鸟的 `debuggingPort`，输出统一结构。
 8. `_write_feishu` 写入对应数据多维表，并追加对应历史电子表。
 9. `_safe_notify` 根据“推送人员”的 `open_id` 使用应用机器人定向推送；没有人员 ID 时可退回 webhook。
-10. 主流程把每个店铺的状态和全部指标追加到 `ALL_info`；所有店铺完成后，如果 `robot.summary_recipients` 字典非空，则按字典中的姓名和 `open_id` 逐人发送一次完整汇总。
+10. 主流程把每个店铺的状态和全部指标追加到 `ALL_info`；所有店铺完成后把非空 `ALL_info` 交给 DeepSeek 分析，再按 `robot.summary_recipients` 中的姓名和 `open_id` 逐人发送模型返回文本。
 11. `_cleanup_retention` 清理三张短期多维表中的过期数据，并退出紫鸟客户端。
 
 ## 4. 文件、函数和关键变量
@@ -53,6 +54,7 @@ ziniao_DailyStoreCheck_codex_two/
 - `feishu.bitable.data_tables`：三个短期多维表分别填写自己的 `app_token + table_id`。
 - `feishu.bitable.default_app_token`：如果四张多维表属于同一个应用，可以填公共 token，子项只填 `table_id`。
 - `spreadsheets`：三个历史电子表分别填写 `token + sheet_id`；也可以额外指定完整 `range`。
+- `deepseek.api_key/system_prompt`：DeepSeek API Key 和固定系统提示词；API Key 也可用环境变量 `DEEPSEEK_API_KEY` 覆盖。
 - `retention_days`：短期多维表保留天数。
 - `platforms.*.crawler`：平台到 Python 爬虫类的映射，格式 `模块:类名`。
 
@@ -126,7 +128,12 @@ ziniao_DailyStoreCheck_codex_two/
 - `_cleanup_retention`：只清理短期多维表。
 - `_safe_notify`：消息推送失败不会阻断下一个店铺。
 - `_extract_all_info_values`：统一提取三个平台的全部指标，空指标也保留在 `ALL_info` 中方便排错。
-- `_send_all_info_summary`：仅在 `summary_recipients` 非空时，于整轮任务末尾发送全部平台、全部店铺汇总。
+- `_send_all_info_summary`：整轮任务末尾调用 DeepSeek 分析非空 `ALL_info`，再把返回文本发送给全部 `summary_recipients`。
+
+### `daily_store_check/deepseek_client.py`
+
+- `DeepSeekClient.analyze_all_info`：将结构化 `ALL_info` 序列化为 JSON 文本，调用 Chat Completions 接口并严格解析 `choices[0].message.content`。
+- API Key、系统提示词、模型、地址、温度、输出长度和超时均来自 `deepseek` 配置节点；日志不会输出 API Key。
 
 ### `run_daily_store_check.py`
 
@@ -162,7 +169,7 @@ feishu:
 2. 把应用机器人加入需要发送消息的可见范围。
 3. 控制台“推送人员”必须使用飞书“人员”字段。接口会从人员字段返回值中读取 `open_id`/`user_id`，不会把姓名文本猜成用户 ID。
 4. 控制台店铺名必须与紫鸟 `browserName` 完全一致。
-5. 当前 `robot.receive_id_type` 为 `open_id`；最终汇总接收人在 `robot.summary_recipients` 中按 `姓名: ou_xxx` 填写。字典为空时不发送 `ALL_info` 汇总。
+5. 当前 `robot.receive_id_type` 为 `open_id`；最终汇总接收人在 `robot.summary_recipients` 中按 `姓名: ou_xxx` 填写。字典为空时不发送 DeepSeek 分析结果。
 6. TikTok、Shopee、美客多短期表分别严格使用项目定义的 33、26、32 个字段；不要再为 Shopee 创建通用的“指标/数值/原始数据”字段。
 7. 多维表“采集时间”使用日期字段，程序写入前统一转换为毫秒时间戳。
 8. 三张历史电子表第一行应分别按 `TIKTOK_TABLE_FIELD_ORDER`、`SHOPEE_TABLE_FIELD_ORDER`、`MERCADO_TABLE_FIELD_ORDER` 建立 33、26、32 列。

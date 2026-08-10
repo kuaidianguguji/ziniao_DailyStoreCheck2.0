@@ -35,12 +35,19 @@ LOGIN_BUTTON_XPATHS: list[str] = [
     '//button[normalize-space()="Log In"]',
 ]
 
-# Shopee 奖励广告弹窗的统一关闭按钮 XPath，可同时定位当前出现的两类奖励弹窗。
-# 该弹窗可能延迟出现或在关闭第一层后继续出现第二层，因此后续操作期间也会反复检查。
-AD_POPUP_CLOSE_XPATH = (
-    '//div[contains(@class,"eds-modal__box") and contains(@class,"rewards-homepage-prompt")]'
-    '//i[contains(@class,"eds-modal__close")]'
-)
+# Shopee 广告弹窗关闭按钮按顺序检查：先使用现有奖励弹窗定位，找不到时再检查广告升级通知弹窗。
+# 后续如果出现更多类型，只需在列表末尾追加 XPath，不需要修改关闭函数。
+AD_POPUP_CLOSE_XPATHS: list[str] = [
+    (
+        '//div[contains(@class,"eds-modal__box") and contains(@class,"rewards-homepage-prompt")]'
+        '//i[contains(@class,"eds-modal__close")]'
+    ),
+    (
+        '//div[contains(@class,"shop-ads-upgrade-pre-notice-modal")]'
+        '/ancestor::div[contains(@class,"eds-modal__box")]'
+        '//i[contains(@class,"eds-modal__close")]'
+    ),
+]
 
 # 关闭一层广告弹窗后继续观察的时间，防止第二层弹窗稍晚渲染而被误判为全部关闭。
 AD_POPUP_CHAIN_WAIT_SECONDS = 2
@@ -277,18 +284,19 @@ class ShopeeAuto:
 
     def _close_ad_popup(self, tab: Any, check_position: str = "当前步骤") -> bool:
         """发现奖励广告弹窗时关闭；首次失败后最多重试 3 次，并验证关闭按钮已经消失。"""
-        if not AD_POPUP_CLOSE_XPATH:
-            LOGGER.warning("[Shopee][广告弹窗跳过] 检查位置=%s，关闭按钮 XPath 为空", check_position)
+        configured_xpaths = [str(xpath or "").strip() for xpath in AD_POPUP_CLOSE_XPATHS if str(xpath or "").strip()]
+        if not configured_xpaths:
+            LOGGER.warning("[Shopee][广告弹窗跳过] 检查位置=%s，关闭按钮 XPath 列表为空", check_position)
             return False
 
         max_attempts = CLICK_RETRY_TIMES + 1
         detected = False
         for attempt in range(max_attempts):
-            close_element = self._find_action_element(
+            active_xpath, close_element = self._find_ad_popup_close_element(
                 tab,
-                AD_POPUP_CLOSE_XPATH,
+                configured_xpaths,
                 timeout=0.5,
-                target_name="广告弹窗关闭按钮",
+                require_action_element=True,
             )
             if not close_element:
                 if detected:
@@ -303,7 +311,7 @@ class ShopeeAuto:
                 LOGGER.warning(
                     "[Shopee][发现广告弹窗] 检查位置=%s，准备关闭，xpath=%s",
                     check_position,
-                    AD_POPUP_CLOSE_XPATH,
+                    active_xpath,
                 )
                 detected = True
 
@@ -320,19 +328,26 @@ class ShopeeAuto:
 
             try:
                 LOGGER.info(
-                    "[Shopee][广告弹窗点击] 检查位置=%s，第 %s/%s 次尝试",
+                    "[Shopee][广告弹窗点击] 检查位置=%s，第 %s/%s 次尝试，xpath=%s",
                     check_position,
                     attempt + 1,
                     max_attempts,
+                    active_xpath,
                 )
                 self._click_element_with_fallback(
                     tab,
                     close_element,
-                    AD_POPUP_CLOSE_XPATH,
+                    active_xpath,
                     "关闭Shopee广告弹窗",
                 )
                 time.sleep(0.5)
-                if not self._find_visible_element(tab, AD_POPUP_CLOSE_XPATH, timeout=0.5):
+                visible_xpath, visible_close_element = self._find_ad_popup_close_element(
+                    tab,
+                    configured_xpaths,
+                    timeout=0.5,
+                    require_action_element=False,
+                )
+                if not visible_close_element:
                     LOGGER.info(
                         "[Shopee][广告弹窗单层已关闭] 检查位置=%s，第 %s/%s 次点击后关闭按钮消失，继续观察 %.1f 秒",
                         check_position,
@@ -342,15 +357,23 @@ class ShopeeAuto:
                     )
                     followup_deadline = time.monotonic() + AD_POPUP_CHAIN_WAIT_SECONDS
                     followup_found = False
+                    followup_xpath = ""
                     while time.monotonic() < followup_deadline:
-                        if self._find_visible_element(tab, AD_POPUP_CLOSE_XPATH, timeout=0.25):
+                        followup_xpath, followup_element = self._find_ad_popup_close_element(
+                            tab,
+                            configured_xpaths,
+                            timeout=0.25,
+                            require_action_element=False,
+                        )
+                        if followup_element:
                             followup_found = True
                             break
                         time.sleep(0.25)
                     if followup_found:
                         LOGGER.warning(
-                            "[Shopee][发现连续广告弹窗] 检查位置=%s，第一层关闭后统一 XPath 再次出现，继续关闭下一层",
+                            "[Shopee][发现连续广告弹窗] 检查位置=%s，第一层关闭后又发现关闭按钮，继续关闭下一层，xpath=%s",
                             check_position,
+                            followup_xpath,
                         )
                         continue
                     LOGGER.info(
@@ -362,10 +385,11 @@ class ShopeeAuto:
                     )
                     return True
                 LOGGER.warning(
-                    "[Shopee][广告弹窗验证失败] 检查位置=%s，第 %s/%s 次点击后关闭按钮仍然可见",
+                    "[Shopee][广告弹窗验证失败] 检查位置=%s，第 %s/%s 次点击后仍发现弹窗关闭按钮，xpath=%s",
                     check_position,
                     attempt + 1,
                     max_attempts,
+                    visible_xpath,
                 )
             except Exception as exc:
                 LOGGER.warning(
@@ -377,12 +401,34 @@ class ShopeeAuto:
                 )
 
         LOGGER.error(
-            "[Shopee][广告弹窗关闭失败] 检查位置=%s，连续 %s 次点击后弹窗仍未确认关闭，xpath=%s",
+            "[Shopee][广告弹窗关闭失败] 检查位置=%s，连续 %s 次点击后弹窗仍未确认关闭，xpaths=%s",
             check_position,
             max_attempts,
-            AD_POPUP_CLOSE_XPATH,
+            configured_xpaths,
         )
         return False
+
+    def _find_ad_popup_close_element(
+        self,
+        tab: Any,
+        xpaths: list[str],
+        timeout: float,
+        require_action_element: bool,
+    ) -> tuple[str, Any]:
+        """按配置顺序查找弹窗关闭按钮，并返回实际命中的 XPath 和元素。"""
+        for xpath_index, xpath in enumerate(xpaths, start=1):
+            if require_action_element:
+                element = self._find_action_element(
+                    tab,
+                    xpath,
+                    timeout=timeout,
+                    target_name=f"第{xpath_index}个广告弹窗关闭按钮",
+                )
+            else:
+                element = self._find_visible_element(tab, xpath, timeout=timeout)
+            if element:
+                return xpath, element
+        return "", None
 
     def _login_if_needed(self, tab: Any) -> bool:
         """依次检查多个登录按钮；发现后点击并等待登录后的菜单出现。"""
