@@ -35,6 +35,10 @@ LOGIN_BUTTON_XPATHS: list[str] = [
     '//button[normalize-space()="Log In"]',
 ]
 
+# Shopee 奖励/广告弹窗的关闭按钮。
+# 该弹窗可能延迟出现或进入广告页后再次出现，因此页面加载、按钮点击和指标读取期间都会检查。
+AD_POPUP_CLOSE_XPATH = '//div[contains(@class,"rewards-escrow-popup-modal")]//i[contains(@class,"eds-modal__close")]'
+
 # 如果“Shopee广告”不可见，需要先点击“营销中心”展开菜单。
 MARKETING_CENTER_BUTTON_XPATH = '(//ul[@class="sidebar-menu"]/li)[3]//span[@class="sidebar-menu-item-text"]'
 
@@ -182,9 +186,12 @@ class ShopeeAuto:
         self._wait_for_page_ready(tab, PAGE_READY_TIMEOUT_SECONDS)
         LOGGER.info("[Shopee][页面] 主文档等待结束，额外等待 %s 秒让菜单完成渲染", AFTER_PAGE_READY_WAIT_SECONDS)
         time.sleep(AFTER_PAGE_READY_WAIT_SECONDS)
+        self._close_ad_popup(tab, "页面加载完成后")
 
         # 页面可能处于未登录状态；按配置顺序检查多个登录按钮 XPath。
         self._login_if_needed(tab)
+        # 登录跳转完成后弹窗可能才开始渲染，因此再次检查一次。
+        self._close_ad_popup(tab, "登录检查完成后")
 
         # 广告按钮可见时直接点击；不可见时先展开营销中心。
         first_period_xpath = self._first_step_xpath(PERIOD_CLICK_STEPS.get("昨天", []))
@@ -261,6 +268,94 @@ class ShopeeAuto:
         LOGGER.info("[Shopee][结果打包] rows=%s", json.dumps(rows, ensure_ascii=False, default=str))
         LOGGER.info("[Shopee][完成] 店铺=%s，有效指标=%s/%s", store_name, valid_count, len(rows))
         return rows
+
+    def _close_ad_popup(self, tab: Any, check_position: str = "当前步骤") -> bool:
+        """发现奖励广告弹窗时关闭；首次失败后最多重试 3 次，并验证关闭按钮已经消失。"""
+        if not AD_POPUP_CLOSE_XPATH:
+            LOGGER.warning("[Shopee][广告弹窗跳过] 检查位置=%s，关闭按钮 XPath 为空", check_position)
+            return False
+
+        max_attempts = CLICK_RETRY_TIMES + 1
+        detected = False
+        for attempt in range(max_attempts):
+            close_element = self._find_action_element(
+                tab,
+                AD_POPUP_CLOSE_XPATH,
+                timeout=0.5,
+                target_name="广告弹窗关闭按钮",
+            )
+            if not close_element:
+                if detected:
+                    LOGGER.info(
+                        "[Shopee][广告弹窗关闭成功] 检查位置=%s，关闭按钮已经消失",
+                        check_position,
+                    )
+                    return True
+                return False
+
+            if not detected:
+                LOGGER.warning(
+                    "[Shopee][发现广告弹窗] 检查位置=%s，准备关闭，xpath=%s",
+                    check_position,
+                    AD_POPUP_CLOSE_XPATH,
+                )
+                detected = True
+
+            if attempt > 0:
+                interval = CLICK_RETRY_INTERVAL_SECONDS + random.uniform(0, 1)
+                LOGGER.warning(
+                    "[Shopee][广告弹窗重试] 检查位置=%s，第 %s/%s 次点击前等待 %.2f 秒",
+                    check_position,
+                    attempt + 1,
+                    max_attempts,
+                    interval,
+                )
+                time.sleep(interval)
+
+            try:
+                LOGGER.info(
+                    "[Shopee][广告弹窗点击] 检查位置=%s，第 %s/%s 次尝试",
+                    check_position,
+                    attempt + 1,
+                    max_attempts,
+                )
+                self._click_element_with_fallback(
+                    tab,
+                    close_element,
+                    AD_POPUP_CLOSE_XPATH,
+                    "关闭Shopee广告弹窗",
+                )
+                time.sleep(0.5)
+                if not self._find_visible_element(tab, AD_POPUP_CLOSE_XPATH, timeout=0.5):
+                    LOGGER.info(
+                        "[Shopee][广告弹窗关闭成功] 检查位置=%s，第 %s/%s 次点击后关闭按钮已经消失",
+                        check_position,
+                        attempt + 1,
+                        max_attempts,
+                    )
+                    return True
+                LOGGER.warning(
+                    "[Shopee][广告弹窗验证失败] 检查位置=%s，第 %s/%s 次点击后关闭按钮仍然可见",
+                    check_position,
+                    attempt + 1,
+                    max_attempts,
+                )
+            except Exception as exc:
+                LOGGER.warning(
+                    "[Shopee][广告弹窗关闭异常] 检查位置=%s，第 %s/%s 次失败，异常=%s",
+                    check_position,
+                    attempt + 1,
+                    max_attempts,
+                    exc,
+                )
+
+        LOGGER.error(
+            "[Shopee][广告弹窗关闭失败] 检查位置=%s，连续 %s 次点击后弹窗仍未确认关闭，xpath=%s",
+            check_position,
+            max_attempts,
+            AD_POPUP_CLOSE_XPATH,
+        )
+        return False
 
     def _login_if_needed(self, tab: Any) -> bool:
         """依次检查多个登录按钮；发现后点击并等待登录后的菜单出现。"""
@@ -393,6 +488,8 @@ class ShopeeAuto:
         """按钮首次点击失败后重试 3 次，状态验证失败也视为本次点击失败。"""
         max_attempts = CLICK_RETRY_TIMES + 1
         for attempt in range(max_attempts):
+            # 弹窗可能在任意按钮操作前延迟出现，先关闭再查找目标按钮。
+            self._close_ad_popup(tab, f"{step_name}点击前")
             if scroll_to_center:
                 self._scroll_element_to_center(tab, xpath, step_name)
             if success_xpath and success_state == "visible" and self._element_state_matches(tab, success_xpath, "visible"):
@@ -591,6 +688,7 @@ class ShopeeAuto:
         hidden_checks = 0
         LOGGER.info("[Shopee][状态等待] 目标=%s，期望=%s，最长 %.1f 秒，xpath=%s", target_name, expected_state, timeout_seconds, xpath)
         while time.monotonic() < deadline:
+            self._close_ad_popup(tab, f"等待{target_name}状态时")
             visible = bool(self._find_action_element(tab, xpath, timeout=1, target_name=target_name))
             if expected_state == "visible" and visible:
                 LOGGER.info("[Shopee][状态满足] 目标=%s 已出现，耗时 %.2f 秒", target_name, time.monotonic() - started_at)
@@ -632,12 +730,16 @@ class ShopeeAuto:
         """等待下一按钮或数据；没有目标 XPath 时固定等待 30 秒。"""
         if not xpath:
             LOGGER.warning("[Shopee][元素等待] 目标=%s 未配置 XPath，固定等待 %.1f 秒", target_name, timeout_seconds)
-            time.sleep(timeout_seconds)
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                self._close_ad_popup(tab, f"固定等待{target_name}时")
+                time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
             return True
         started_at = time.monotonic()
         deadline = started_at + timeout_seconds
         LOGGER.info("[Shopee][元素等待] 目标=%s，最长 %.1f 秒，xpath=%s", target_name, timeout_seconds, xpath)
         while time.monotonic() < deadline:
+            self._close_ad_popup(tab, f"等待{target_name}出现时")
             if self._find_action_element(tab, xpath, timeout=1, target_name=target_name):
                 LOGGER.info("[Shopee][元素出现] 目标=%s，耗时 %.2f 秒", target_name, time.monotonic() - started_at)
                 return True
@@ -657,6 +759,7 @@ class ShopeeAuto:
         deadline = started_at + timeout_seconds
         LOGGER.info("[Shopee][多元素等待] 目标=%s，候选数=%s，最长 %.1f 秒", target_name, len(candidates), timeout_seconds)
         while time.monotonic() < deadline:
+            self._close_ad_popup(tab, f"等待{target_name}出现时")
             for index, xpath in enumerate(candidates, start=1):
                 if self._find_action_element(tab, xpath, timeout=1, target_name=target_name):
                     LOGGER.info(
@@ -677,6 +780,7 @@ class ShopeeAuto:
             LOGGER.warning("[Shopee][指标跳过] 字段=%s，原因=XPath 为空", field_name)
             return ""
         for attempt in range(2):
+            self._close_ad_popup(tab, f"读取指标{field_name}前")
             if attempt > 0:
                 LOGGER.warning("[Shopee][指标重试] 字段=%s，第 2/2 次读取前等待 %s 秒，xpath=%s", field_name, CLICK_RETRY_INTERVAL_SECONDS, xpath)
                 time.sleep(CLICK_RETRY_INTERVAL_SECONDS)
