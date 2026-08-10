@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import time
 import unicodedata
 from datetime import datetime, timezone
 from typing import Any
@@ -167,16 +168,30 @@ class DailyStoreCheck:
         # ALL_info 保存本轮所有平台、所有店铺的采集结果和失败状态。
         # 它只在全部店铺结束后用于 summary_recipients 汇总推送，不影响每店铺即时推送。
         ALL_info: list[dict[str, Any]] = []
+        # 仅在内存中保存本轮各店铺的完整处理耗时，最后通过 print 输出到终端，不写入运行日志或飞书。
+        store_processing_times: dict[str, dict[str, Any]] = {}
         tasks = self.feishu.list_control_tasks()
         if not tasks:
             LOGGER.info("没有可执行店铺，可能是控制表为空、开关暂停或飞书尚未配置")
+            self._print_store_processing_times(store_processing_times)
             return
 
         try:
             self._prepare_ziniao()
             close_failed = False
             for task in tasks:
-                store_info = self._run_store(task)
+                # 从即将打开当前店铺开始计时，直到爬取、飞书处理和店铺关闭全部执行完才停止。
+                store_started_at = time.perf_counter()
+                try:
+                    store_info = self._run_store(task)
+                finally:
+                    elapsed_seconds = time.perf_counter() - store_started_at
+                    timing_key = self._build_store_timing_key(store_processing_times, task.store_name)
+                    store_processing_times[timing_key] = {
+                        "平台": task.platform,
+                        "耗时秒": round(elapsed_seconds, 2),
+                        "耗时": self._format_elapsed_time(elapsed_seconds),
+                    }
                 ALL_info.append(store_info)
                 if store_info.get("中止后续店铺"):
                     LOGGER.critical("店铺 %s 未确认关闭，本轮不再打开后续店铺", task.store_name)
@@ -192,7 +207,45 @@ class DailyStoreCheck:
             try:
                 self._send_all_info_summary(ALL_info)
             finally:
-                self.ziniao.exit_client()
+                try:
+                    self.ziniao.exit_client()
+                finally:
+                    # 用户要求在所有业务、汇总推送和紫鸟退出之后，最末尾只向终端打印计时字典。
+                    self._print_store_processing_times(store_processing_times)
+
+    @staticmethod
+    def _build_store_timing_key(store_processing_times: dict[str, Any], store_name: str) -> str:
+        """生成不会覆盖旧结果的店铺键；控制表出现同名店铺时自动增加序号。"""
+        base_name = str(store_name or "未命名店铺")
+        if base_name not in store_processing_times:
+            return base_name
+
+        duplicate_index = 2
+        while f"{base_name}#{duplicate_index}" in store_processing_times:
+            duplicate_index += 1
+        return f"{base_name}#{duplicate_index}"
+
+    @staticmethod
+    def _format_elapsed_time(elapsed_seconds: float) -> str:
+        """把秒数转换为便于终端阅读的“小时/分/秒”文本，并保留两位小数。"""
+        safe_seconds = max(0.0, float(elapsed_seconds))
+        hours = int(safe_seconds // 3600)
+        minutes = int((safe_seconds % 3600) // 60)
+        seconds = safe_seconds % 60
+        if hours:
+            return f"{hours}小时{minutes}分{seconds:.2f}秒"
+        if minutes:
+            return f"{minutes}分{seconds:.2f}秒"
+        return f"{seconds:.2f}秒"
+
+    @staticmethod
+    def _print_store_processing_times(store_processing_times: dict[str, dict[str, Any]]) -> None:
+        """在整轮程序最末尾只打印店铺名到可读耗时的字典，不写入日志文件。"""
+        display_times = {
+            store_name: str(details.get("耗时") or "")
+            for store_name, details in store_processing_times.items()
+        }
+        print(json.dumps(display_times, ensure_ascii=False, separators=(",", ":")))
 
     def _prepare_ziniao(self) -> None:
         """启动紫鸟、更新内核并缓存全部店铺信息。"""

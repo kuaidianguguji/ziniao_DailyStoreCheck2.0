@@ -35,9 +35,15 @@ LOGIN_BUTTON_XPATHS: list[str] = [
     '//button[normalize-space()="Log In"]',
 ]
 
-# Shopee 奖励/广告弹窗的关闭按钮。
-# 该弹窗可能延迟出现或进入广告页后再次出现，因此页面加载、按钮点击和指标读取期间都会检查。
-AD_POPUP_CLOSE_XPATH = '//div[contains(@class,"rewards-escrow-popup-modal")]//i[contains(@class,"eds-modal__close")]'
+# Shopee 奖励广告弹窗的统一关闭按钮 XPath，可同时定位当前出现的两类奖励弹窗。
+# 该弹窗可能延迟出现或在关闭第一层后继续出现第二层，因此后续操作期间也会反复检查。
+AD_POPUP_CLOSE_XPATH = (
+    '//div[contains(@class,"eds-modal__box") and contains(@class,"rewards-homepage-prompt")]'
+    '//i[contains(@class,"eds-modal__close")]'
+)
+
+# 关闭一层广告弹窗后继续观察的时间，防止第二层弹窗稍晚渲染而被误判为全部关闭。
+AD_POPUP_CHAIN_WAIT_SECONDS = 2
 
 # 如果“Shopee广告”不可见，需要先点击“营销中心”展开菜单。
 MARKETING_CENTER_BUTTON_XPATH = '(//ul[@class="sidebar-menu"]/li)[3]//span[@class="sidebar-menu-item-text"]'
@@ -328,10 +334,31 @@ class ShopeeAuto:
                 time.sleep(0.5)
                 if not self._find_visible_element(tab, AD_POPUP_CLOSE_XPATH, timeout=0.5):
                     LOGGER.info(
-                        "[Shopee][广告弹窗关闭成功] 检查位置=%s，第 %s/%s 次点击后关闭按钮已经消失",
+                        "[Shopee][广告弹窗单层已关闭] 检查位置=%s，第 %s/%s 次点击后关闭按钮消失，继续观察 %.1f 秒",
                         check_position,
                         attempt + 1,
                         max_attempts,
+                        AD_POPUP_CHAIN_WAIT_SECONDS,
+                    )
+                    followup_deadline = time.monotonic() + AD_POPUP_CHAIN_WAIT_SECONDS
+                    followup_found = False
+                    while time.monotonic() < followup_deadline:
+                        if self._find_visible_element(tab, AD_POPUP_CLOSE_XPATH, timeout=0.25):
+                            followup_found = True
+                            break
+                        time.sleep(0.25)
+                    if followup_found:
+                        LOGGER.warning(
+                            "[Shopee][发现连续广告弹窗] 检查位置=%s，第一层关闭后统一 XPath 再次出现，继续关闭下一层",
+                            check_position,
+                        )
+                        continue
+                    LOGGER.info(
+                        "[Shopee][广告弹窗关闭成功] 检查位置=%s，第 %s/%s 次点击后连续 %.1f 秒未出现下一层弹窗",
+                        check_position,
+                        attempt + 1,
+                        max_attempts,
+                        AD_POPUP_CHAIN_WAIT_SECONDS,
                     )
                     return True
                 LOGGER.warning(
