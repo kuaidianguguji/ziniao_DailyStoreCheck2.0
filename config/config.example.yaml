@@ -83,6 +83,10 @@ deepseek:
   temperature: 0.7
   max_tokens: 2000
   timeout_seconds: 120
+  # 首次分析失败后最多重试 5 次，即最多请求 6 次；HTTP、响应解析和空内容都会触发重试。
+  retry_times: 5
+  # 相邻两次 DeepSeek 请求之间的等待秒数。
+  retry_interval_seconds: 3
   system_prompt: |
     你是中国一个专业南美跨境电商公司总经理，擅长店铺的数据分析。严格按照用户要求处理输入文本。
     输出尽量简洁，不要多余废话。这分别是 TikTok、Shopee、美客多巴西跨境电商后台的广告数据和店铺概览数据，帮我总结分析这些店铺。

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 import requests
@@ -35,6 +36,10 @@ class DeepSeekClient:
         self.temperature = float(deepseek_config.get("temperature", 0.7))
         self.max_tokens = int(deepseek_config.get("max_tokens", 2000))
         self.timeout_seconds = int(deepseek_config.get("timeout_seconds", 120))
+        # retry_times 表示首次请求失败后允许再次请求的次数，因此配置 5 时最多请求 6 次。
+        self.retry_times = max(0, int(deepseek_config.get("retry_times", 5)))
+        # 每次重试前固定等待，避免接口短暂限流或网络抖动时立即连续请求。
+        self.retry_interval_seconds = max(0.0, float(deepseek_config.get("retry_interval_seconds", 3)))
         self.session = requests.Session()
 
     @property
@@ -86,16 +91,64 @@ class DeepSeekClient:
         }
         request_url = f"{self.base_url}/chat/completions"
         LOGGER.info(
-            "[DeepSeek][请求准备] url=%s，model=%s，店铺数=%s，ALL_info字符数=%s，temperature=%s，max_tokens=%s",
+            "[DeepSeek][请求准备] url=%s，model=%s，店铺数=%s，ALL_info字符数=%s，temperature=%s，max_tokens=%s，重试次数=%s，重试间隔=%.1f秒",
             request_url,
             self.model_name,
             len(all_info),
             len(user_text),
             self.temperature,
             self.max_tokens,
+            self.retry_times,
+            self.retry_interval_seconds,
         )
         LOGGER.info("[DeepSeek][ALL_info输入] %s", json.dumps(all_info, ensure_ascii=False, default=str))
 
+        total_attempts = self.retry_times + 1
+        for attempt in range(1, total_attempts + 1):
+            LOGGER.info("[DeepSeek][分析请求] 第 %s/%s 次尝试", attempt, total_attempts)
+            try:
+                answer = self._request_analysis(request_url, headers, request_body)
+            except Exception as exc:
+                if attempt >= total_attempts:
+                    LOGGER.error(
+                        "[DeepSeek][分析最终失败] 已完成 %s 次请求，最后异常=%s",
+                        total_attempts,
+                        exc,
+                        exc_info=True,
+                    )
+                    raise RuntimeError(f"DeepSeek 分析连续 {total_attempts} 次失败: {exc}") from exc
+
+                LOGGER.warning(
+                    "[DeepSeek][分析失败准备重试] 第 %s/%s 次失败，异常=%s；%.1f 秒后进行第 %s 次尝试",
+                    attempt,
+                    total_attempts,
+                    exc,
+                    self.retry_interval_seconds,
+                    attempt + 1,
+                )
+                if self.retry_interval_seconds > 0:
+                    time.sleep(self.retry_interval_seconds)
+                continue
+
+            LOGGER.info(
+                "[DeepSeek][分析成功] 第 %s/%s 次请求成功，返回字符数=%s，分析结果=%r",
+                attempt,
+                total_attempts,
+                len(answer),
+                answer,
+            )
+            return answer
+
+        # 理论上循环只能成功返回或在最后一次失败时抛出异常，此处用于类型检查和防御性保护。
+        raise RuntimeError("DeepSeek 分析未返回结果")
+
+    def _request_analysis(
+        self,
+        request_url: str,
+        headers: dict[str, str],
+        request_body: dict[str, Any],
+    ) -> str:
+        """执行一次 DeepSeek 请求；HTTP、解析、结构或空内容异常均交给外层重试。"""
         try:
             response = self.session.post(
                 request_url,
@@ -108,7 +161,7 @@ class DeepSeekClient:
             response_text = ""
             if getattr(exc, "response", None) is not None:
                 response_text = str(exc.response.text or "")[:1000]
-            LOGGER.exception("[DeepSeek][HTTP失败] 异常=%s，response=%r", exc, response_text)
+            LOGGER.warning("[DeepSeek][HTTP失败] 异常=%s，response=%r", exc, response_text)
             raise RuntimeError(f"DeepSeek HTTP 请求失败: {exc}") from exc
 
         try:
@@ -123,7 +176,6 @@ class DeepSeekClient:
             LOGGER.error("[DeepSeek][响应结构错误] response=%s", json.dumps(response_json, ensure_ascii=False, default=str))
             raise RuntimeError("DeepSeek 响应缺少 choices[0].message.content") from exc
         if not answer:
+            LOGGER.warning("[DeepSeek][响应内容为空] choices[0].message.content 没有有效文本")
             raise RuntimeError("DeepSeek 返回的分析文本为空")
-
-        LOGGER.info("[DeepSeek][分析成功] 返回字符数=%s，分析结果=%r", len(answer), answer)
         return answer

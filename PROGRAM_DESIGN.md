@@ -135,7 +135,7 @@ ziniao_DailyStoreCheck_codex_two/
 ### `daily_store_check/deepseek_client.py`
 
 - `DeepSeekClient.analyze_all_info`：将结构化 `ALL_info` 序列化为 JSON 文本，调用 Chat Completions 接口并严格解析 `choices[0].message.content`。
-- API Key、系统提示词、模型、地址、温度、输出长度和超时均来自 `deepseek` 配置节点；日志不会输出 API Key。
+- API Key、系统提示词、模型、地址、温度、输出长度和超时均来自 `deepseek` 配置节点；日志不会输出 API Key。HTTP 失败、响应解析失败、响应结构错误或返回文本为空时，首次失败后按配置最多重试 5 次。
 
 ### `run_daily_store_check.py`
 
