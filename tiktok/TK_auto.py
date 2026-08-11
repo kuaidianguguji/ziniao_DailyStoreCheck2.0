@@ -9,14 +9,18 @@
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import logging
+import os
 import random
 import re
 import time
 from datetime import datetime, timezone
 from typing import Any
 
+import requests
 from DrissionPage import Chromium
 
 
@@ -33,6 +37,27 @@ LOGIN_EMAIL_SELECTED_XPATH = (
 LOGIN_BUTTON_XPATH = '//button[@id="TikTok_Ads_SSO_Login_Btn"]'
 # 只有出现“手机号格式错误”提示时才切换到邮箱登录；没有该提示时直接点击登录。
 LOGIN_PHONE_FORMAT_ERROR_XPATH = '//span[contains(@class,"error-msg") and normalize-space(.)="请检查输入的手机号格式"]'
+
+# 登录提交后可能出现的“两个相同 3D 物体”验证码。
+CAPTCHA_IMAGE_XPATH = '//img[@alt="captchaOpti_hCaptchaModal1_header"]'
+CAPTCHA_CONFIRM_BUTTON_XPATH = '//button[normalize-space(.)="确认"]'
+# 单次识别或提交失败后的额外重试次数；值为 2 表示最多处理 3 张验证码图片。
+CAPTCHA_SOLVE_RETRY_TIMES = 2
+# 点击验证码确认按钮后，等待业务菜单、验证码消失或验证码图片更新的最长秒数。
+CAPTCHA_SUBMIT_RESULT_TIMEOUT_SECONDS = 15
+# 登录按钮提交后，等待业务菜单、手机号错误或验证码出现的最长秒数。
+LOGIN_SUBMIT_RESULT_TIMEOUT_SECONDS = 30
+
+# 发送给通义千问视觉模型的固定提示词。模型只能返回两个原图像素坐标。
+CAPTCHA_QWEN_PROMPT = """
+这是相似物体匹配验证码，图中有多个3D物体，请找出两个形状相似的物体。务必记住下面4条规则注意：1.一定要忽略物体大小和物体颜色；
+2.一定只考虑物体是阿拉伯数字、26个英语字母和规则的几何形状（具体只考虑这几种几何形状：圆柱体、球体、长方体、正方体、多面体）；
+3.两相形状似物体经常存在视角不一样（比如一个是正面，一个是斜侧等等）；
+4.千万别被阴影干扰，阴影的方向不统一，阴影的颜色深浅不一样（唯一相同点是阴影颜色都属于灰色系，只是颜色深浅不一样）。
+严格只返回JSON，不要任何解释、不要markdown标记。
+输出格式：{"p1":[x1,y1],"p2":[x2,y2]}
+坐标为图片像素坐标，左上角是原点(0,0)。
+""".strip()
 
 # 首页弹窗和滑块验证码的关闭按钮。
 # 登录流程结束后，验证码可能在任意阶段出现，因此点击、等待和读取指标前都会检查一次。
@@ -706,15 +731,23 @@ class TiktokAuto:
 
         self._click_login_button(tab, "登录-点击登录按钮")
 
-        # 某些页面只有第一次按手机号模式提交后才显示格式错误，因此再观察一次提交结果。
-        if not switched_to_email:
-            login_outcome = self._wait_for_direct_login_outcome(tab, LOGIN_DETECTION_TIMEOUT_SECONDS)
-            if login_outcome == "phone_error":
-                LOGGER.warning("[TikTok][登录判断] 直接登录后出现手机号格式错误，开始切换邮箱并重新登录")
-                self._switch_to_email_login(tab)
-                self._click_login_button(tab, "登录-邮箱模式重新点击登录按钮")
+        # 每次提交后同时等待业务菜单、手机号格式错误和图形验证码，避免只等待菜单导致验证码超时。
+        login_outcome = self._wait_for_login_outcome(tab, LOGIN_SUBMIT_RESULT_TIMEOUT_SECONDS)
+        if login_outcome == "phone_error":
+            if switched_to_email:
+                raise RuntimeError("TikTok 已切换邮箱登录，但仍显示手机号格式错误")
+            LOGGER.warning("[TikTok][登录判断] 直接登录后出现手机号格式错误，开始切换邮箱并重新登录")
+            self._switch_to_email_login(tab)
+            switched_to_email = True
+            self._click_login_button(tab, "登录-邮箱模式重新点击登录按钮")
+            login_outcome = self._wait_for_login_outcome(tab, LOGIN_SUBMIT_RESULT_TIMEOUT_SECONDS)
 
-        if not self._wait_for_main_navigation(tab, ENTRY_ELEMENT_TIMEOUT_SECONDS):
+        if login_outcome == "captcha":
+            self._solve_login_captcha(tab)
+        elif login_outcome == "phone_error":
+            raise RuntimeError("TikTok 邮箱模式登录后仍显示手机号格式错误")
+
+        if not self._wait_for_main_navigation(tab, ENTRY_ELEMENT_TIMEOUT_SECONDS, handle_login_captcha=True):
             raise TimeoutError("TikTok 登录后未出现营销按钮或店铺广告按钮")
         LOGGER.info("[TikTok][登录成功] 已发现营销按钮或店铺广告按钮，不等待整页加载完成")
 
@@ -742,15 +775,18 @@ class TiktokAuto:
         ):
             raise RuntimeError("TikTok 登录按钮点击失败")
 
-    def _wait_for_direct_login_outcome(self, tab: Any, timeout_seconds: float) -> str:
-        """直接登录后等待业务菜单或手机号格式错误出现，不检查 document.readyState。"""
+    def _wait_for_login_outcome(self, tab: Any, timeout_seconds: float) -> str:
+        """登录提交后等待业务菜单、手机号格式错误或图形验证码，不检查 document.readyState。"""
         started_at = time.monotonic()
         deadline = started_at + timeout_seconds
-        LOGGER.info("[TikTok][登录结果等待] 最长 %.1f 秒等待业务菜单或手机号格式错误提示", timeout_seconds)
+        LOGGER.info("[TikTok][登录结果等待] 最长 %.1f 秒等待业务菜单、手机号格式错误或图形验证码", timeout_seconds)
         while time.monotonic() < deadline:
             if self._element_state_matches(tab, LOGIN_PHONE_FORMAT_ERROR_XPATH, "visible"):
                 LOGGER.warning("[TikTok][登录结果] 已出现“请检查输入的手机号格式”")
                 return "phone_error"
+            if self._element_state_matches(tab, CAPTCHA_IMAGE_XPATH, "visible"):
+                LOGGER.warning("[TikTok][登录结果] 已发现物体匹配验证码")
+                return "captcha"
             navigation_name = self._main_navigation_name(tab)
             if navigation_name:
                 LOGGER.info("[TikTok][登录结果] 已发现%s，直接登录成功", navigation_name)
@@ -759,8 +795,346 @@ class TiktokAuto:
         LOGGER.info("[TikTok][登录结果等待] %.1f 秒内没有明确结果，继续等待业务菜单", time.monotonic() - started_at)
         return "pending"
 
-    def _wait_for_main_navigation(self, tab: Any, timeout_seconds: float) -> bool:
-        """轮询营销/店铺广告按钮；任意一个可见就立即继续，不等待整页加载完成。"""
+    def _solve_login_captcha(self, tab: Any) -> None:
+        """调用通义千问识别两个相同物体，并在当前紫鸟标签页完成坐标点击和提交。"""
+        captcha_config = self.config.get("captcha", {})
+        if not isinstance(captcha_config, dict):
+            raise RuntimeError("TikTok captcha 配置必须是字典")
+        if not bool(captcha_config.get("enabled", True)):
+            raise RuntimeError("TikTok 已出现验证码，但 platforms.tiktok.captcha.enabled 为 false")
+
+        api_key = str(captcha_config.get("qwen_api_key") or os.getenv("DASHSCOPE_API_KEY", "")).strip()
+        if not api_key:
+            raise RuntimeError("TikTok 已出现验证码，但未配置 captcha.qwen_api_key 或 DASHSCOPE_API_KEY")
+
+        endpoint = str(
+            captcha_config.get("endpoint")
+            or "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+        ).strip()
+        model = str(captcha_config.get("model") or "qwen-vl-max").strip()
+        request_timeout = float(captcha_config.get("request_timeout_seconds", 60) or 60)
+        max_attempts = CAPTCHA_SOLVE_RETRY_TIMES + 1
+        LOGGER.warning(
+            "[TikTok][验证码处理] 开始识别物体匹配验证码，模型=%s，最多尝试=%s次",
+            model,
+            max_attempts,
+        )
+
+        for attempt in range(max_attempts):
+            captcha_img = self._find_visible_element(tab, CAPTCHA_IMAGE_XPATH, timeout=3)
+            if not captcha_img:
+                LOGGER.info("[TikTok][验证码处理] 第 %s/%s 次处理前验证码已经消失", attempt + 1, max_attempts)
+                return
+
+            image_src = str(captcha_img.attr("src") or "").strip()
+            try:
+                image_bytes = self._read_captcha_image_bytes(captcha_img, image_src, request_timeout)
+                try:
+                    image_base64, image_width, image_height = self._image_bytes_to_jpeg_base64(image_bytes)
+                except RuntimeError:
+                    raise
+                except Exception as image_exc:
+                    # CDN 地址可能返回登录页或拦截页而不是图片，此时直接截取页面中的验证码元素。
+                    LOGGER.warning("[TikTok][验证码图片解析失败] 回退为元素截图，异常=%s", image_exc)
+                    screenshot = captcha_img.get_screenshot(as_bytes="png", scroll_to_center=True)
+                    if not screenshot:
+                        raise RuntimeError("TikTok 验证码元素截图失败") from image_exc
+                    image_base64, image_width, image_height = self._image_bytes_to_jpeg_base64(bytes(screenshot))
+                point1, point2, raw_reply = self._call_qwen_captcha(
+                    api_key,
+                    endpoint,
+                    model,
+                    request_timeout,
+                    image_base64,
+                    image_width,
+                    image_height,
+                )
+                LOGGER.info(
+                    "[TikTok][验证码识别成功] 第 %s/%s 次，原图尺寸=%sx%s，p1=%s，p2=%s，模型原始返回=%r",
+                    attempt + 1,
+                    max_attempts,
+                    image_width,
+                    image_height,
+                    point1,
+                    point2,
+                    raw_reply,
+                )
+
+                # 模型请求期间验证码可能自动刷新；刷新后旧图片坐标不得继续使用。
+                current_img = self._find_visible_element(tab, CAPTCHA_IMAGE_XPATH, timeout=2)
+                if not current_img:
+                    LOGGER.info("[TikTok][验证码处理] 模型返回前验证码已经消失，无需继续点击")
+                    return
+                current_src = str(current_img.attr("src") or "").strip()
+                if image_src and current_src and current_src != image_src:
+                    LOGGER.warning("[TikTok][验证码图片已更新] 本次识别结果作废，重新识别新图片")
+                    continue
+
+                click_points = self._convert_captcha_points(
+                    current_img,
+                    point1,
+                    point2,
+                    image_width,
+                    image_height,
+                )
+                self._click_captcha_points(tab, click_points)
+                self._click_captcha_confirm(tab)
+                if self._wait_for_captcha_submission(tab, image_src, CAPTCHA_SUBMIT_RESULT_TIMEOUT_SECONDS):
+                    LOGGER.info("[TikTok][验证码处理成功] 验证码已通过或已关闭")
+                    return
+                LOGGER.warning("[TikTok][验证码处理重试] 提交后验证码仍存在或已刷新，准备重新识别")
+            except Exception as exc:
+                LOGGER.exception(
+                    "[TikTok][验证码处理失败] 第 %s/%s 次异常=%s",
+                    attempt + 1,
+                    max_attempts,
+                    exc,
+                )
+
+            if attempt < CAPTCHA_SOLVE_RETRY_TIMES:
+                self._human_wait(tab, CLICK_RETRY_INTERVAL_SECONDS, check_interruptions=False)
+
+        raise RuntimeError(f"TikTok 物体匹配验证码连续 {max_attempts} 次处理失败")
+
+    @staticmethod
+    def _read_captcha_image_bytes(captcha_img: Any, image_src: str, timeout_seconds: float) -> bytes:
+        """把验证码图片读入内存；远程地址失败时回退为元素截图，不向磁盘写文件。"""
+        try:
+            if image_src.startswith("data:") and "," in image_src:
+                encoded = image_src.split(",", 1)[1]
+                image_bytes = base64.b64decode(encoded)
+                if image_bytes:
+                    return image_bytes
+            if image_src.startswith("//"):
+                image_src = f"https:{image_src}"
+            if image_src.startswith(("http://", "https://")):
+                response = requests.get(image_src, timeout=timeout_seconds)
+                response.raise_for_status()
+                if response.content:
+                    return response.content
+        except Exception as exc:
+            LOGGER.warning("[TikTok][验证码图片下载失败] 将回退为元素截图，异常=%s", exc)
+
+        screenshot = captcha_img.get_screenshot(as_bytes="png", scroll_to_center=True)
+        if not screenshot:
+            raise RuntimeError("无法下载或截取 TikTok 验证码图片")
+        return bytes(screenshot)
+
+    @staticmethod
+    def _image_bytes_to_jpeg_base64(image_bytes: bytes) -> tuple[str, int, int]:
+        """用 Pillow 把内存图片转为 JPEG Base64，并返回模型坐标所对应的原图尺寸。"""
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise RuntimeError("缺少 Pillow，请先执行 pip install -r requirements.txt") from exc
+
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image.load()
+            width, height = image.size
+            rgb_image = image.convert("RGB")
+            output = io.BytesIO()
+            rgb_image.save(output, format="JPEG", quality=85)
+        encoded = base64.b64encode(output.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}", int(width), int(height)
+
+    @staticmethod
+    def _call_qwen_captcha(
+        api_key: str,
+        endpoint: str,
+        model: str,
+        timeout_seconds: float,
+        image_base64: str,
+        image_width: int,
+        image_height: int,
+    ) -> tuple[tuple[float, float], tuple[float, float], str]:
+        """调用千问视觉模型，并严格解析、校验 p1/p2 两个图片像素坐标。"""
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": model,
+            "input": {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"text": CAPTCHA_QWEN_PROMPT},
+                            {"image": image_base64},
+                        ],
+                    }
+                ]
+            },
+            "parameters": {"temperature": 0.0, "max_tokens": 1200},
+        }
+        response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout_seconds)
+        response.raise_for_status()
+        response_json = response.json()
+        try:
+            raw_reply = response_json["output"]["choices"][0]["message"]["content"][0]["text"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ValueError(f"千问验证码响应结构异常: {response_json}") from exc
+
+        json_match = re.search(r"\{.*\}", str(raw_reply), re.S)
+        if not json_match:
+            raise ValueError(f"千问返回内容中没有 JSON 坐标: {raw_reply!r}")
+        coordinate_data = json.loads(json_match.group(0))
+
+        points: list[tuple[float, float]] = []
+        for point_name in ("p1", "p2"):
+            point = coordinate_data.get(point_name)
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                raise ValueError(f"验证码坐标 {point_name} 格式错误: {point!r}")
+            x, y = float(point[0]), float(point[1])
+            if not (0 <= x <= image_width and 0 <= y <= image_height):
+                raise ValueError(
+                    f"验证码坐标 {point_name}=({x}, {y}) 超出图片范围 {image_width}x{image_height}"
+                )
+            points.append((x, y))
+        return points[0], points[1], str(raw_reply)
+
+    @staticmethod
+    def _convert_captcha_points(
+        captcha_img: Any,
+        point1: tuple[float, float],
+        point2: tuple[float, float],
+        image_width: int,
+        image_height: int,
+    ) -> list[tuple[float, float]]:
+        """把模型给出的原图像素坐标换算为当前浏览器视口中的 CSS 像素坐标。"""
+        try:
+            captcha_img.run_js("this.scrollIntoView({behavior:'smooth', block:'center', inline:'center'});")
+            time.sleep(0.5)
+        except Exception:
+            pass
+        left, top = captcha_img.rect.viewport_location
+        rendered_width, rendered_height = captcha_img.rect.size
+        if image_width <= 0 or image_height <= 0 or rendered_width <= 0 or rendered_height <= 0:
+            raise ValueError("验证码原图或页面渲染尺寸无效")
+
+        converted: list[tuple[float, float]] = []
+        for x, y in (point1, point2):
+            converted.append(
+                (
+                    float(left) + x * float(rendered_width) / image_width,
+                    float(top) + y * float(rendered_height) / image_height,
+                )
+            )
+        LOGGER.info(
+            "[TikTok][验证码坐标换算] 页面位置=(%.1f, %.1f)，渲染尺寸=%.1fx%.1f，点击坐标=%s",
+            left,
+            top,
+            rendered_width,
+            rendered_height,
+            converted,
+        )
+        return converted
+
+    def _click_captcha_points(self, tab: Any, points: list[tuple[float, float]]) -> None:
+        """通过 CDP 在当前紫鸟标签页按贝塞尔轨迹依次点击两个验证码坐标。"""
+        viewport_center = tab.run_js("return [window.innerWidth / 2, window.innerHeight / 2];")
+        if not isinstance(viewport_center, (list, tuple)) or len(viewport_center) != 2:
+            viewport_center = (400, 300)
+        current_x, current_y = float(viewport_center[0]), float(viewport_center[1])
+
+        for index, (target_x, target_y) in enumerate(points, start=1):
+            path = self._bezier_mouse_path(current_x, current_y, target_x, target_y)
+            for path_x, path_y in path:
+                tab.run_cdp("Input.dispatchMouseEvent", type="mouseMoved", x=path_x, y=path_y)
+                time.sleep(random.uniform(0.015, 0.035))
+            tab.run_cdp(
+                "Input.dispatchMouseEvent",
+                type="mousePressed",
+                x=target_x,
+                y=target_y,
+                button="left",
+                buttons=1,
+                clickCount=1,
+            )
+            time.sleep(random.uniform(0.05, 0.12))
+            tab.run_cdp(
+                "Input.dispatchMouseEvent",
+                type="mouseReleased",
+                x=target_x,
+                y=target_y,
+                button="left",
+                buttons=0,
+                clickCount=1,
+            )
+            LOGGER.info("[TikTok][验证码坐标点击] 已点击第%s个物体，坐标=(%.1f, %.1f)", index, target_x, target_y)
+            current_x, current_y = target_x, target_y
+            time.sleep(random.uniform(0.35, 0.65))
+
+    @staticmethod
+    def _bezier_mouse_path(
+        start_x: float,
+        start_y: float,
+        end_x: float,
+        end_y: float,
+        steps: int = 25,
+    ) -> list[tuple[float, float]]:
+        """生成三阶贝塞尔鼠标轨迹，减少两次坐标点击之间的机械直跳。"""
+        control1_x = start_x + (end_x - start_x) * random.uniform(0.2, 0.6)
+        control1_y = start_y + (end_y - start_y) * random.uniform(0.1, 0.7)
+        control2_x = start_x + (end_x - start_x) * random.uniform(0.4, 0.9)
+        control2_y = start_y + (end_y - start_y) * random.uniform(0.3, 0.8)
+        path: list[tuple[float, float]] = []
+        for index in range(steps + 1):
+            progress = index / steps
+            remaining = 1 - progress
+            x = (
+                remaining**3 * start_x
+                + 3 * remaining**2 * progress * control1_x
+                + 3 * remaining * progress**2 * control2_x
+                + progress**3 * end_x
+            )
+            y = (
+                remaining**3 * start_y
+                + 3 * remaining**2 * progress * control1_y
+                + 3 * remaining * progress**2 * control2_y
+                + progress**3 * end_y
+            )
+            path.append((x, y))
+        return path
+
+    def _click_captcha_confirm(self, tab: Any) -> None:
+        """点击验证码确认按钮；确认按钮不存在时立即报错，避免错误坐标被当作已提交。"""
+        confirm_button = self._find_visible_element(tab, CAPTCHA_CONFIRM_BUTTON_XPATH, timeout=5)
+        if not confirm_button:
+            raise RuntimeError("TikTok 验证码确认按钮不可见")
+        self._prepare_human_click(tab, confirm_button, "验证码-点击确认按钮")
+        confirm_button.click()
+        self._record_button_click()
+        LOGGER.info("[TikTok][验证码提交] 已点击确认按钮，开始等待验证结果")
+
+    def _wait_for_captcha_submission(self, tab: Any, previous_src: str, timeout_seconds: float) -> bool:
+        """验证码提交后等待业务菜单；图片更新表示识别失败，需要重新处理新验证码。"""
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            navigation_name = self._main_navigation_name(tab)
+            if navigation_name:
+                LOGGER.info("[TikTok][验证码结果] 已发现%s，验证码通过", navigation_name)
+                return True
+
+            captcha_img = self._find_visible_element(tab, CAPTCHA_IMAGE_XPATH, timeout=0.5)
+            if captcha_img:
+                current_src = str(captcha_img.attr("src") or "").strip()
+                if previous_src and current_src and current_src != previous_src:
+                    LOGGER.warning("[TikTok][验证码结果] 验证码图片已经更新，需要重新识别")
+                    return False
+            self._human_wait(tab, 0.5, check_interruptions=False)
+
+        captcha_still_visible = self._element_state_matches(tab, CAPTCHA_IMAGE_XPATH, "visible")
+        if not captcha_still_visible:
+            LOGGER.info("[TikTok][验证码结果] 验证码图片已经消失，继续等待业务菜单")
+            return True
+        LOGGER.warning("[TikTok][验证码结果] 等待 %.1f 秒后原验证码仍可见", timeout_seconds)
+        return False
+
+    def _wait_for_main_navigation(
+        self,
+        tab: Any,
+        timeout_seconds: float,
+        handle_login_captcha: bool = False,
+    ) -> bool:
+        """轮询营销/店铺广告按钮；登录阶段可同时接管延迟出现的验证码。"""
         started_at = time.monotonic()
         deadline = started_at + timeout_seconds
         LOGGER.info("[TikTok][业务入口等待] 最长 %.1f 秒等待营销按钮或店铺广告按钮", timeout_seconds)
@@ -773,6 +1147,9 @@ class TiktokAuto:
                     time.monotonic() - started_at,
                 )
                 return True
+            if handle_login_captcha and self._element_state_matches(tab, CAPTCHA_IMAGE_XPATH, "visible"):
+                LOGGER.warning("[TikTok][业务入口等待] 发现延迟出现的登录验证码，立即进入验证码处理")
+                self._solve_login_captcha(tab)
             self._human_wait(tab, 0.5, check_interruptions=False)
         LOGGER.error("[TikTok][业务入口超时] 未找到营销按钮或店铺广告按钮")
         return False

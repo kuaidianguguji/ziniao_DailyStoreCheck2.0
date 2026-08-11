@@ -6,6 +6,7 @@ cffi==1.17.1
 charset-normalizer==3.4.1
 cryptography==44.0.1
 DrissionPage==4.1.1.4
+Pillow>=11,<13
 h11==0.14.0
 h2==4.2.0
 hpack==4.1.0

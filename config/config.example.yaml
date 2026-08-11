@@ -95,6 +95,14 @@ data:
 platforms:
   tiktok:
     crawler: "tiktok.TK_auto:TiktokAuto"
+    captcha:
+      # 登录后出现物体匹配验证码时，是否启用通义千问视觉识别。
+      enabled: true
+      # 可在这里填写，也可以通过环境变量 DASHSCOPE_API_KEY 注入。
+      qwen_api_key: ""
+      model: "qwen-vl-plus"
+      endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+      request_timeout_seconds: 60
   shopee:
     crawler: "shopee.SP_auto:ShopeeAuto"
   mercado:
