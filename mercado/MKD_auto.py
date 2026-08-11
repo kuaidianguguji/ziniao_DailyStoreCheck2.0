@@ -2,7 +2,7 @@
 
 本文件独立维护美客多的 DrissionPage 连接、XPath、数值解析和飞书字段组装。
 程序先接管紫鸟已经打开的当前标签页，确认店铺首页加载完成后，
-再使用同一个标签页进入固定的美客多经营指标页面，不会创建普通浏览器。
+再根据当前网址选择对应的美客多经营指标页面，不会创建普通浏览器。
 
 下面各指标 XPath 集中维护在本文件中；当前已填写的 XPath 可以直接调整。
 如果某个 XPath 为空、元素不存在或数值解析失败，该指标默认写入空值，其他指标继续执行。
@@ -28,9 +28,10 @@ LOGGER = logging.getLogger(__name__)
 # 美客多首页广告弹窗的关闭按钮。
 HOME_AD_CLOSE_XPATH = '//button[@class="andes-modal__close-button"]'
 
-# 紫鸟打开并登录美客多店铺后，使用当前标签页直接进入这个经营指标页面。
-# 该页面就是日期切换和数据抓取页面，不再点击“销售量 -> 指标”等菜单按钮。
+# 紫鸟当前网址包含 vendedores 时，使用卖家后台专用的经营指标页面。
 METRICS_PAGE_URL = "https://vendedores.mercadolivre.com.br/metricas/negocio/visao-geral#from=seller-menu"
+# 紫鸟当前网址不包含 vendedores、为空或读取失败时，使用普通美客多域名的指标页面。
+GENERAL_METRICS_PAGE_URL = "https://www.mercadolivre.com.br/metricas#sc-menu"
 
 # 页面和按钮操作参数。重试次数 3 表示首次点击失败后再重试 3 次。
 PAGE_READY_TIMEOUT_SECONDS = 60
@@ -216,12 +217,21 @@ class MercadoAuto:
         return [row]
 
     def _open_metrics_page(self, tab: Any) -> None:
-        """在紫鸟当前登录标签页打开经营指标网址，并等待页面及日期控件完成渲染。"""
-        LOGGER.info("[美客多][页面跳转] 准备在紫鸟当前标签页打开经营指标页，url=%s", METRICS_PAGE_URL)
+        """根据紫鸟当前网址选择经营指标页，并等待页面及日期控件完成渲染。"""
+        current_url = self._read_current_url(tab)
+        metrics_page_url = self._select_metrics_page_url(current_url)
+        contains_vendedores = "vendedores" in current_url.casefold()
+        LOGGER.info(
+            "[美客多][网址判断] 当前网址=%r，是否包含vendedores=%s，选择指标页=%s",
+            current_url or "<空网址>",
+            "是" if contains_vendedores else "否",
+            metrics_page_url,
+        )
+        LOGGER.info("[美客多][页面跳转] 准备在紫鸟当前标签页打开经营指标页，url=%s", metrics_page_url)
         try:
-            tab.get(METRICS_PAGE_URL)
+            tab.get(metrics_page_url)
         except Exception as exc:
-            LOGGER.error("[美客多][页面跳转失败] 无法打开经营指标页，url=%s，异常=%s", METRICS_PAGE_URL, exc)
+            LOGGER.error("[美客多][页面跳转失败] 无法打开经营指标页，url=%s，异常=%s", metrics_page_url, exc)
             raise RuntimeError(f"无法打开美客多经营指标页: {exc}") from exc
 
         if not self._wait_for_page_ready(tab, PAGE_READY_TIMEOUT_SECONDS, "经营指标页"):
@@ -239,6 +249,32 @@ class MercadoAuto:
             "经营指标页日期切换按钮",
         ):
             raise RuntimeError("经营指标页加载后未发现日期切换按钮，停止本店铺采集")
+
+    @staticmethod
+    def _read_current_url(tab: Any) -> str:
+        """读取紫鸟当前标签页网址；属性读取失败时回退到 JavaScript location.href。"""
+        try:
+            current_url = getattr(tab, "url", "")
+            if callable(current_url):
+                current_url = current_url()
+            current_url = str(current_url or "").strip()
+            if current_url:
+                return current_url
+        except Exception as exc:
+            LOGGER.warning("[美客多][网址读取异常] tab.url 读取失败=%s，尝试读取 location.href", exc)
+
+        try:
+            return str(tab.run_js("return window.location.href;") or "").strip()
+        except Exception as exc:
+            LOGGER.warning("[美客多][网址读取失败] location.href 读取失败=%s，按普通域名指标页处理", exc)
+            return ""
+
+    @staticmethod
+    def _select_metrics_page_url(current_url: str) -> str:
+        """当前网址包含 vendedores 时选卖家后台指标页，否则选普通域名指标页。"""
+        if "vendedores" in str(current_url or "").casefold():
+            return METRICS_PAGE_URL
+        return GENERAL_METRICS_PAGE_URL
 
     def _close_home_ad(self, tab: Any) -> bool:
         """关闭经营指标页可能出现的广告弹窗；未出现时直接继续。"""
