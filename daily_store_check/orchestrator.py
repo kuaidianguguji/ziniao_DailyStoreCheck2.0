@@ -350,7 +350,7 @@ class DailyStoreCheck:
         )
         for recipient_name, receive_id in recipients.items():
             LOGGER.info("[飞书][DeepSeek汇总发送] 接收人姓名=%s，准备发送 AI 店铺分析", recipient_name)
-            self._safe_notify(receive_id, "DeepSeek全部店铺数据分析", analysis_text)
+            self._safe_notify_markdown(receive_id, "DeepSeek全部店铺数据分析", analysis_text)
 
     def _safe_notify(self, recipient: str, title: str, content: str) -> None:
         """推送失败只记录日志，不影响关闭店铺和后续店铺。"""
@@ -364,6 +364,19 @@ class DailyStoreCheck:
             self.feishu.send_robot_message(recipient, title, content)
         except Exception:
             LOGGER.exception("飞书消息推送失败 recipient=%s", recipient)
+
+    def _safe_notify_markdown(self, recipient: str, title: str, content: str) -> None:
+        """以 interactive Markdown 卡片发送 DeepSeek 汇总，失败时不影响任务收尾。"""
+        try:
+            LOGGER.info(
+                "[飞书][Markdown机器人消息打包] recipient=%s，title=%r，markdown=%r",
+                recipient or "<空接收人>",
+                title,
+                content,
+            )
+            self.feishu.send_robot_markdown_message(recipient, title, content)
+        except Exception:
+            LOGGER.exception("飞书 Markdown 消息推送失败 recipient=%s", recipient)
 
     def _find_browser_identifier(self, store_name: str) -> str:
         """按店铺名匹配紫鸟店铺，优先 browserOauth。"""

@@ -73,7 +73,7 @@ ziniao_DailyStoreCheck_codex_two/
 - `batch_create_records`：每 500 条分批写入数据多维表。
 - `remove_old_records`：按采集时间计算 90 天截止线并批量删除过期记录。
 - `append_spreadsheet_rows`：向历史电子表追加二维数组。
-- `send_robot_message`：优先应用机器人按 `receive_id_type` 定向发送；webhook 只作为固定群机器人兜底。
+- `send_robot_message`：优先应用机器人按 `receive_id_type` 定向发送；webhook 只作为固定群机器人兜底。`send_robot_markdown_message` 为 DeepSeek 汇总发送 Card 2.0 `interactive` 消息，卡片正文使用 `tag=markdown`。
 - `configured`：凭据是否齐全；不齐全时读写接口进入 dry-run 并记录日志。
 
 ### `daily_store_check/ziniao_client.py`
@@ -130,7 +130,7 @@ ziniao_DailyStoreCheck_codex_two/
 - `_cleanup_retention`：只清理短期多维表。
 - `_safe_notify`：消息推送失败不会阻断下一个店铺。
 - `_extract_all_info_values`：统一提取三个平台的全部指标，空指标也保留在 `ALL_info` 中方便排错。
-- `_send_all_info_summary`：整轮任务末尾调用 DeepSeek 分析非空 `ALL_info`，再把返回文本发送给全部 `summary_recipients`。
+- `_send_all_info_summary`：整轮任务末尾调用 DeepSeek 分析非空 `ALL_info`，再把返回 Markdown 通过 interactive 卡片发送给全部 `summary_recipients`。
 
 ### `daily_store_check/deepseek_client.py`
 

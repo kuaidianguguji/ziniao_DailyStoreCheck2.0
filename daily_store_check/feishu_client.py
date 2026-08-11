@@ -411,6 +411,77 @@ class FeishuClient:
             raise RuntimeError(f"飞书机器人推送失败: {result}")
         LOGGER.info("[飞书][Webhook机器人成功] response=%s", self._json_for_log(result))
 
+    def send_robot_markdown_message(self, recipient: str, title: str, markdown_content: str) -> None:
+        """使用飞书 interactive 卡片把 Markdown 内容推送给指定接收人。
+
+        应用机器人接口要求把 Card 2.0 JSON 序列化到 ``content`` 字符串中；
+        webhook 接口则要求把同一张卡片直接放到顶层 ``card`` 字段中。
+        这样 DeepSeek 返回的标题、列表、加粗和换行会由飞书按 Markdown 渲染，
+        而不是作为普通纯文本显示。
+        """
+        recipients = [item.strip() for item in recipient.split(",") if item.strip()]
+        markdown_text = str(markdown_content or "").strip()
+        if not markdown_text:
+            LOGGER.warning("[飞书][Markdown机器人跳过] Markdown 内容为空，recipient=%s", recipient)
+            return
+
+        # 标题放进 markdown 元素，保持应用机器人和 webhook 的卡片结构完全一致。
+        # 使用二级标题避免覆盖 DeepSeek 自己返回的一级标题。
+        card: dict[str, Any] = {
+            "schema": "2.0",
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": f"## {str(title or '消息').strip()}\n\n{markdown_text}",
+                    }
+                ]
+            },
+        }
+
+        if recipients and self.config.get("app_id") and self.config.get("app_secret"):
+            receive_id_type = self.config.get("robot", {}).get("receive_id_type", "open_id")
+            for receive_id in recipients:
+                request_body = {
+                    "receive_id": receive_id,
+                    "msg_type": "interactive",
+                    # /im/v1/messages 的 interactive content 必须是 JSON 字符串。
+                    "content": json.dumps(card, ensure_ascii=False),
+                }
+                LOGGER.info(
+                    "[飞书][应用机器人Markdown JSON] receive_id_type=%s，body=%s",
+                    receive_id_type,
+                    self._json_for_log(request_body),
+                )
+                self._request(
+                    "POST",
+                    "/open-apis/im/v1/messages",
+                    headers=self._headers(),
+                    params={"receive_id_type": receive_id_type},
+                    json=request_body,
+                )
+            return
+
+        webhook = self.config.get("robot", {}).get("webhook_url", "")
+        if not webhook:
+            LOGGER.warning("飞书机器人 webhook 未配置，跳过 Markdown 推送 recipient=%s", recipient)
+            return
+
+        body: dict[str, Any] = {"msg_type": "interactive", "card": card}
+        secret = self.config.get("robot", {}).get("sign_secret", "")
+        if secret:
+            timestamp = str(int(time.time()))
+            body["timestamp"] = timestamp
+            body["sign"] = self._sign(timestamp, secret)
+        LOGGER.info("[飞书][Webhook机器人Markdown JSON] body=%s", self._json_for_log(body))
+        response = requests.post(webhook, json=body, timeout=self.timeout)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("code", 0) != 0:
+            LOGGER.error("[飞书][Webhook机器人Markdown失败] response=%s", self._json_for_log(result))
+            raise RuntimeError(f"飞书 Markdown 机器人推送失败: {result}")
+        LOGGER.info("[飞书][Webhook机器人Markdown成功] response=%s", self._json_for_log(result))
+
     @staticmethod
     def _sign(timestamp: str, secret: str) -> str:
         """生成飞书机器人要求的 base64 HMAC-SHA256 签名。"""
