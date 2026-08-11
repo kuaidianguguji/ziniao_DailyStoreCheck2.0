@@ -27,6 +27,15 @@ LOGGER = logging.getLogger(__name__)
 # 一、Shopee 广告页面按钮 XPath
 # ---------------------------------------------------------------------------
 
+# 同时包含密码输入框和账号输入框的 form 是 Shopee 未登录页面的明确标志。
+# 一旦检测到该表单，当前店铺不再执行登录、菜单点击或数据采集，而是抛出异常，
+# 由外层 ZiniaoStoreSession 使用紫鸟官方 stopBrowser 关闭店铺后继续下一店铺。
+LOGIN_FORM_XPATH = '//form[.//input[@name="password"] and .//input[@name="loginKey"]]'
+
+# 刚接管紫鸟标签页时等待登录表单出现的最长时间，单位为秒。
+# 首次检查结束后，页面完成加载时还会再次检查，避免异步渲染较慢导致漏判。
+LOGIN_FORM_DETECTION_TIMEOUT_SECONDS = 5
+
 # Shopee 未登录页面可能因语言或版本不同而使用不同的登录按钮。
 # 程序严格按列表顺序检查：第一个 XPath 没找到可见元素时，才检查第二个 XPath。
 # 以后遇到新的登录页面，可以继续在列表末尾追加 XPath，不需要修改登录处理函数。
@@ -195,9 +204,25 @@ class ShopeeAuto:
         tab = browser.latest_tab
         collected_at = datetime.now(timezone.utc).isoformat()
 
+        # 登录表单的优先级最高。检测到后通过异常退出 collect，外层紫鸟会话负责关闭店铺。
+        self._raise_if_login_required(
+            tab,
+            store_name,
+            check_position="刚接管紫鸟标签页",
+            timeout_seconds=LOGIN_FORM_DETECTION_TIMEOUT_SECONDS,
+        )
+
         self._wait_for_page_ready(tab, PAGE_READY_TIMEOUT_SECONDS)
         LOGGER.info("[Shopee][页面] 主文档等待结束，额外等待 %s 秒让菜单完成渲染", AFTER_PAGE_READY_WAIT_SECONDS)
         time.sleep(AFTER_PAGE_READY_WAIT_SECONDS)
+
+        # 页面异步内容可能在首次检查之后才渲染，因此在任何弹窗或菜单操作前复查一次。
+        self._raise_if_login_required(
+            tab,
+            store_name,
+            check_position="页面加载完成后",
+            timeout_seconds=1,
+        )
         self._close_ad_popup(tab, "页面加载完成后")
 
         # 页面可能处于未登录状态；按配置顺序检查多个登录按钮 XPath。
@@ -280,6 +305,49 @@ class ShopeeAuto:
         LOGGER.info("[Shopee][结果打包] rows=%s", json.dumps(rows, ensure_ascii=False, default=str))
         LOGGER.info("[Shopee][完成] 店铺=%s，有效指标=%s/%s", store_name, valid_count, len(rows))
         return rows
+
+    @staticmethod
+    def _raise_if_login_required(
+        tab: Any,
+        store_name: str,
+        check_position: str,
+        timeout_seconds: float,
+    ) -> None:
+        """检查未登录 form；存在时立即终止当前店铺，让外层紫鸟会话执行关闭。"""
+        LOGGER.info(
+            "[Shopee][登录表单检查] 店铺=%s，检查位置=%s，最长等待=%.1f秒，xpath=%s",
+            store_name,
+            check_position,
+            timeout_seconds,
+            LOGIN_FORM_XPATH,
+        )
+        try:
+            # 用户要求按元素是否存在判断，因此这里不额外要求元素可见或具备点击尺寸。
+            login_form = tab.ele(f"xpath:{LOGIN_FORM_XPATH}", timeout=timeout_seconds)
+        except Exception as exc:
+            LOGGER.warning(
+                "[Shopee][登录表单检查异常] 店铺=%s，检查位置=%s，异常=%s；继续按已登录流程处理",
+                store_name,
+                check_position,
+                exc,
+            )
+            return
+
+        if not login_form:
+            LOGGER.info("[Shopee][登录表单未发现] 店铺=%s，检查位置=%s，继续后续操作", store_name, check_position)
+            return
+
+        error_message = (
+            f"Shopee 店铺 {store_name} 检测到登录表单，当前账号需要登录；"
+            "已停止本店铺采集，正在通过紫鸟关闭店铺，关闭成功后继续下一店铺。"
+        )
+        LOGGER.error(
+            "[Shopee][需要登录-停止当前店铺] 店铺=%s，检查位置=%s，xpath=%s",
+            store_name,
+            check_position,
+            LOGIN_FORM_XPATH,
+        )
+        raise RuntimeError(error_message)
 
     def _close_ad_popup(self, tab: Any, check_position: str = "当前步骤") -> bool:
         """发现奖励广告弹窗时关闭；首次失败后最多重试 3 次，并验证关闭按钮已经消失。"""
