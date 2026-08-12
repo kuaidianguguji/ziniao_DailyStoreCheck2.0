@@ -13,12 +13,13 @@ ziniao:
     username: ""
     password: ""
 
-# 默认等待到每天 07:00 执行一次；使用 --run-now 可立即执行。
+# 启动后常驻后台，每天等待到 07:00 执行；使用 --run-now 可立即执行一轮并退出。
 schedule:
   enabled: true
   run_time: "07:00"
   timezone: "Asia/Shanghai"
-  run_once: true
+  # false=执行完成后继续常驻，true=执行一轮后退出（适合外部任务计划程序）。
+  run_once: false
 
 feishu:
   base_url: "https://open.feishu.cn"

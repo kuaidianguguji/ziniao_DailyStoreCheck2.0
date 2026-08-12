@@ -48,6 +48,9 @@ LOGIN_BUTTON_XPATHS: list[str] = [
 # 后续如果出现更多类型，只需在列表末尾追加 XPath，不需要修改关闭函数。
 AD_POPUP_CLOSE_XPATHS: list[str] = [
     (
+        '//div[contains(@class,"eds-modal__mask") and not(contains(@style,"display: none"))]//i[contains(@class,"eds-modal__close")]'
+    ),
+    (
         '//div[contains(@class,"eds-modal__box") and contains(@class,"rewards-homepage-prompt")]'
         '//i[contains(@class,"eds-modal__close")]'
     ),
@@ -55,7 +58,7 @@ AD_POPUP_CLOSE_XPATHS: list[str] = [
         '//div[contains(@class,"shop-ads-upgrade-pre-notice-modal")]'
         '/ancestor::div[contains(@class,"eds-modal__box")]'
         '//i[contains(@class,"eds-modal__close")]'
-    ),
+    )
 ]
 
 # 关闭一层广告弹窗后继续观察的时间，防止第二层弹窗稍晚渲染而被误判为全部关闭。
@@ -83,8 +86,9 @@ PAGE_READY_TIMEOUT_SECONDS = 60
 # 这 10 秒用于等待 Shopee 的菜单、弹窗和异步页面内容继续渲染。
 AFTER_PAGE_READY_WAIT_SECONDS = 10
 
-# 按钮首次点击失败后允许再次重试的次数。
-# 当前值为 3，表示“首次点击 1 次 + 失败后重试 3 次”，所以一个按钮最多点击 4 次。
+# 普通按钮首次点击失败后允许再次重试的次数。
+# 当前值为 3，表示“首次点击 1 次 + 失败后重试 3 次”；Shopee 广告入口和日期按钮
+# 使用下面各自独立的 8 次重试配置，不受这个通用值限制。
 CLICK_RETRY_TIMES = 3
 
 # 同一个按钮前后两次点击尝试之间的最短间隔，单位为秒。
@@ -94,6 +98,18 @@ CLICK_RETRY_INTERVAL_SECONDS = 2
 # 点击按钮后，等待下一个按钮、日期选项或页面数据出现的最长时间，单位为秒。
 # 如果没有可用于判断加载完成的 XPath，也会使用这个值固定等待 30 秒。
 NEXT_ELEMENT_TIMEOUT_SECONDS = 30
+
+# Shopee 广告入口和日期按钮的专项重试次数。
+# 数值 8 表示首次点击 1 次 + 失败后重试 8 次，一个按钮最多尝试 9 次。
+SHOPEE_AD_CLICK_RETRY_TIMES = 8
+PERIOD_CLICK_RETRY_TIMES = 8
+
+# Shopee 广告入口点击后页面跳转较慢：每次点击后最多等待约 3 秒检查时间按钮，
+# 未出现才进入下一次尝试。这个等待窗口只用于“广告入口 -> 时间按钮”的状态确认。
+SHOPEE_AD_NEXT_ELEMENT_WAIT_SECONDS = 3
+
+# 日期面板点击后等待“昨天/最近 7 天”选项出现的时间；选项消失的确认仍使用通用 30 秒。
+PERIOD_OPTION_WAIT_SECONDS = 3
 
 # ---------------------------------------------------------------------------
 # 二、昨天和最近 7 天的日期切换步骤
@@ -106,16 +122,22 @@ PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
         {
             "name": "广告-打开时间选择面板（昨天）",
             "xpath": TIME_SWITCH_BUTTON_XPATH,
-            "scroll_to_center": True,
             "wait_seconds": 1,
+            "retry_times": PERIOD_CLICK_RETRY_TIMES,
+            "retry_interval_seconds": 2,
+            "success_timeout_seconds": PERIOD_OPTION_WAIT_SECONDS,
             "success_xpath": YESTERDAY_OPTION_XPATH,
             "success_state": "visible",
             "success_name": "昨天选项出现",
+            "scroll_after_success_xpath": TIME_SWITCH_BUTTON_XPATH,
+            "scroll_after_success_name": "昨天时间面板打开后重新定位时间按钮",
         },
         {
             "name": "广告-选择昨天",
             "xpath": YESTERDAY_OPTION_XPATH,
             "wait_seconds": 2,
+            "retry_times": PERIOD_CLICK_RETRY_TIMES,
+            "retry_interval_seconds": 2,
             "success_xpath": YESTERDAY_OPTION_XPATH,
             "success_state": "hidden",
             "success_name": "昨天选项消失",
@@ -125,16 +147,22 @@ PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
         {
             "name": "广告-打开时间选择面板（7天）",
             "xpath": TIME_SWITCH_BUTTON_XPATH,
-            "scroll_to_center": True,
             "wait_seconds": 1,
+            "retry_times": PERIOD_CLICK_RETRY_TIMES,
+            "retry_interval_seconds": 2,
+            "success_timeout_seconds": PERIOD_OPTION_WAIT_SECONDS,
             "success_xpath": LAST_7_DAYS_OPTION_XPATH,
             "success_state": "visible",
             "success_name": "最近7天选项出现",
+            "scroll_after_success_xpath": TIME_SWITCH_BUTTON_XPATH,
+            "scroll_after_success_name": "7天时间面板打开后重新定位时间按钮",
         },
         {
             "name": "广告-选择最近7天",
             "xpath": LAST_7_DAYS_OPTION_XPATH,
             "wait_seconds": 2,
+            "retry_times": PERIOD_CLICK_RETRY_TIMES,
+            "retry_interval_seconds": 2,
             "success_xpath": LAST_7_DAYS_OPTION_XPATH,
             "success_state": "hidden",
             "success_name": "最近7天选项消失",
@@ -204,6 +232,10 @@ class ShopeeAuto:
         tab = browser.latest_tab
         collected_at = datetime.now(timezone.utc).isoformat()
 
+        # Shopee 首页接管后立即检查一次广告弹窗，避免弹窗遮挡登录表单或后续菜单。
+        # 此时弹窗尚未渲染也不影响，页面加载完成后还会再次检查。
+        self._close_ad_popup(tab, "刚进入Shopee首页")
+
         # 登录表单的优先级最高。检测到后通过异常退出 collect，外层紫鸟会话负责关闭店铺。
         self._raise_if_login_required(
             tab,
@@ -232,13 +264,22 @@ class ShopeeAuto:
 
         # 广告按钮可见时直接点击；不可见时先展开营销中心。
         first_period_xpath = self._first_step_xpath(PERIOD_CLICK_STEPS.get("昨天", []))
-        self._enter_shopee_ads(tab, first_period_xpath)
+        if not self._enter_shopee_ads(tab, first_period_xpath):
+            raise RuntimeError("Shopee 广告按钮多次点击后仍未确认时间切换按钮出现，停止当前店铺采集")
+
+        # 时间按钮出现代表广告页已经完成关键区域加载。这里只滚动一次，失败也不重试滚动，
+        # 后续日期按钮点击仍会按自己的重试规则查找目标元素。
+        self._scroll_element_to_center(tab, TIME_SWITCH_BUTTON_XPATH, "广告页首次定位时间切换按钮")
 
         rows: list[dict[str, Any]] = []
         for period in ("昨天", "7天"):
             LOGGER.info("[Shopee][广告] 开始切换并采集时间范围=%s", period)
             # 选择日期后，时间选项消失才算点击成功；随后固定等待 30 秒让广告表刷新。
-            self._run_click_steps(tab, PERIOD_CLICK_STEPS.get(period, []), final_next_xpath="")
+            if not self._run_click_steps(tab, PERIOD_CLICK_STEPS.get(period, []), final_next_xpath=""):
+                raise RuntimeError(f"Shopee {period} 日期切换多次重试后仍失败，停止当前店铺采集")
+
+            # 日期切换成功后把时间按钮重新放回视口水平中心线，只执行一次且不因滚动失败重试。
+            self._scroll_element_to_center(tab, TIME_SWITCH_BUTTON_XPATH, f"{period}日期切换成功后定位时间按钮")
             for spec in METRIC_SPECS:
                 if spec["period"] != period:
                     continue
@@ -576,23 +617,29 @@ class ShopeeAuto:
             success_xpath=next_xpath,
             success_state="visible" if next_xpath else "",
             success_name="Shopee广告页面的时间切换按钮出现",
+            retry_times=SHOPEE_AD_CLICK_RETRY_TIMES,
+            retry_interval_seconds=0,
+            success_timeout_seconds=SHOPEE_AD_NEXT_ELEMENT_WAIT_SECONDS,
         )
         if not entered:
-            LOGGER.error("[Shopee][菜单失败] Shopee广告按钮连续 4 次点击失败")
+            LOGGER.error(
+                "[Shopee][菜单失败] Shopee广告按钮首次点击加 %s 次重试后，仍未确认时间切换按钮出现",
+                SHOPEE_AD_CLICK_RETRY_TIMES,
+            )
             return False
         # XPath 尚未填写时仍固定等待 30 秒，给广告页面留下完整加载时间。
         if not next_xpath:
             self._wait_for_xpath(tab, "", NEXT_ELEMENT_TIMEOUT_SECONDS, "Shopee广告页面的时间切换按钮")
         return True
 
-    def _run_click_steps(self, tab: Any, steps: list[dict[str, Any]], final_next_xpath: str = "") -> None:
-        """顺序执行按钮步骤，并把点击后的状态验证纳入重试判定。"""
+    def _run_click_steps(self, tab: Any, steps: list[dict[str, Any]], final_next_xpath: str = "") -> bool:
+        """顺序执行日期按钮步骤；任一步最终失败都返回 False，禁止继续读取旧数据。"""
         for index, step in enumerate(steps):
             step_name = str(step.get("name") or f"第 {index + 1} 个未命名按钮")
             xpath = str(step.get("xpath") or "").strip()
             if not xpath:
-                LOGGER.warning("[Shopee][按钮跳过] 步骤=%s，原因=XPath 为空", step_name)
-                continue
+                LOGGER.error("[Shopee][按钮终止] 步骤=%s，原因=XPath 为空", step_name)
+                return False
 
             clicked = self._click_with_retry(
                 tab,
@@ -602,10 +649,26 @@ class ShopeeAuto:
                 success_state=str(step.get("success_state") or "").strip().lower(),
                 success_name=str(step.get("success_name") or "点击后的页面状态"),
                 scroll_to_center=bool(step.get("scroll_to_center", False)),
+                retry_times=int(step.get("retry_times", CLICK_RETRY_TIMES)),
+                retry_interval_seconds=float(step.get("retry_interval_seconds", CLICK_RETRY_INTERVAL_SECONDS)),
+                success_timeout_seconds=float(step.get("success_timeout_seconds", NEXT_ELEMENT_TIMEOUT_SECONDS)),
             )
             if not clicked:
-                LOGGER.error("[Shopee][按钮失败] 步骤=%s，全部 4 次点击和状态验证均失败", step_name)
-                continue
+                retry_times = int(step.get("retry_times", CLICK_RETRY_TIMES))
+                LOGGER.error(
+                    "[Shopee][按钮失败] 步骤=%s，首次点击加 %s 次重试后仍未成功",
+                    step_name,
+                    retry_times,
+                )
+                return False
+
+            scroll_after_success_xpath = str(step.get("scroll_after_success_xpath") or "").strip()
+            if scroll_after_success_xpath:
+                self._scroll_element_to_center(
+                    tab,
+                    scroll_after_success_xpath,
+                    str(step.get("scroll_after_success_name") or f"{step_name}成功后的单次滚动"),
+                )
 
             wait_seconds = float(step.get("wait_seconds", 1) or 0)
             if wait_seconds > 0:
@@ -614,6 +677,7 @@ class ShopeeAuto:
 
             next_xpath = self._next_step_xpath(steps, index + 1) or final_next_xpath
             self._wait_for_xpath(tab, next_xpath, NEXT_ELEMENT_TIMEOUT_SECONDS, f"{step_name} 后的下一按钮或数据")
+        return True
 
     def _click_with_retry(
         self,
@@ -624,9 +688,18 @@ class ShopeeAuto:
         success_state: str = "",
         success_name: str = "点击后的页面状态",
         scroll_to_center: bool = False,
+        retry_times: int = CLICK_RETRY_TIMES,
+        retry_interval_seconds: float = CLICK_RETRY_INTERVAL_SECONDS,
+        success_timeout_seconds: float = NEXT_ELEMENT_TIMEOUT_SECONDS,
     ) -> bool:
-        """按钮首次点击失败后重试 3 次，状态验证失败也视为本次点击失败。"""
-        max_attempts = CLICK_RETRY_TIMES + 1
+        """按按钮自己的次数重试；查找、点击或状态验证失败时都会检查广告弹窗。"""
+        safe_retry_times = max(0, int(retry_times))
+        safe_retry_interval = max(0.0, float(retry_interval_seconds))
+        safe_success_timeout = max(0.1, float(success_timeout_seconds))
+        max_attempts = safe_retry_times + 1
+        # 只有上一次确实向元素发出过点击，才允许把“目标已隐藏”解释为延迟生效。
+        # 否则日期选项从未出现时也属于 hidden，会被错误判定为日期选择成功。
+        previous_click_dispatched = False
         for attempt in range(max_attempts):
             # 弹窗可能在任意按钮操作前延迟出现，先关闭再查找目标按钮。
             self._close_ad_popup(tab, f"{step_name}点击前")
@@ -635,12 +708,20 @@ class ShopeeAuto:
             if success_xpath and success_state == "visible" and self._element_state_matches(tab, success_xpath, "visible"):
                 LOGGER.info("[Shopee][按钮验证成功] 步骤=%s，%s，无需再次点击", step_name, success_name)
                 return True
-            if attempt > 0 and success_xpath and success_state == "hidden" and self._element_state_matches(tab, success_xpath, "hidden"):
+            if (
+                attempt > 0
+                and previous_click_dispatched
+                and success_xpath
+                and success_state == "hidden"
+                and self._element_state_matches(tab, success_xpath, "hidden")
+            ):
                 LOGGER.info("[Shopee][按钮验证成功] 步骤=%s，%s，上一次点击已延迟生效", step_name, success_name)
                 return True
 
             if attempt > 0:
-                interval = CLICK_RETRY_INTERVAL_SECONDS + random.uniform(0, 1)
+                interval = safe_retry_interval
+                if interval > 0:
+                    interval += random.uniform(0, 1)
                 LOGGER.warning(
                     "[Shopee][按钮重试] 步骤=%s，第 %s/%s 次尝试前等待 %.2f 秒，xpath=%s",
                     step_name,
@@ -649,7 +730,8 @@ class ShopeeAuto:
                     interval,
                     xpath,
                 )
-                time.sleep(interval)
+                if interval > 0:
+                    time.sleep(interval)
 
             try:
                 LOGGER.info(
@@ -662,18 +744,21 @@ class ShopeeAuto:
                 element = self._find_action_element(tab, xpath, timeout=5, target_name=step_name)
                 if not element:
                     LOGGER.warning("[Shopee][按钮未找到] 步骤=%s，第 %s/%s 次未找到可见元素", step_name, attempt + 1, max_attempts)
+                    self._close_ad_popup(tab, f"{step_name}第{attempt + 1}次未找到按钮后")
                     continue
                 self._click_element_with_fallback(tab, element, xpath, step_name)
+                previous_click_dispatched = True
                 if success_xpath and success_state:
                     LOGGER.info("[Shopee][按钮已点击] 步骤=%s，开始验证=%s", step_name, success_name)
                     if not self._wait_for_element_state(
                         tab,
                         success_xpath,
                         success_state,
-                        NEXT_ELEMENT_TIMEOUT_SECONDS,
+                        safe_success_timeout,
                         success_name,
                     ):
                         LOGGER.warning("[Shopee][按钮验证失败] 步骤=%s，第 %s/%s 次未满足=%s", step_name, attempt + 1, max_attempts, success_name)
+                        self._close_ad_popup(tab, f"{step_name}第{attempt + 1}次状态验证失败后")
                         continue
                 else:
                     LOGGER.info("[Shopee][按钮已点击] 步骤=%s，无额外状态验证", step_name)
@@ -688,19 +773,22 @@ class ShopeeAuto:
                     exc,
                     xpath,
                 )
+                self._close_ad_popup(tab, f"{step_name}第{attempt + 1}次点击异常后")
 
         LOGGER.error("[Shopee][按钮终止] 步骤=%s，全部 %s 次点击均失败，xpath=%s", step_name, max_attempts, xpath)
         return False
 
     def _scroll_element_to_center(self, tab: Any, xpath: str, target_name: str) -> bool:
-        """把时间切换按钮滚动到屏幕中心，避免按钮在视口外导致点击失败。"""
+        """把时间切换按钮滚动到屏幕水平中心线；只执行一次，失败由调用方继续流程。"""
         if not xpath:
             LOGGER.warning("[Shopee][滚动跳过] 目标=%s，XPath 为空", target_name)
             return False
 
-        element = self._find_action_element(tab, xpath, timeout=3, target_name=target_name)
+        # 滚动的目的就是处理视口外元素，因此不能使用要求“已经位于视口内”的
+        # _find_action_element()；只要 DOM 元素处于 displayed 状态就可以执行滚动。
+        element = self._find_visible_element(tab, xpath, timeout=3)
         if not element:
-            LOGGER.warning("[Shopee][滚动失败] 目标=%s，未找到可见元素，xpath=%s", target_name, xpath)
+            LOGGER.warning("[Shopee][滚动失败且不重试] 目标=%s，未找到DOM可见元素，xpath=%s", target_name, xpath)
             return False
 
         # 优先使用 DrissionPage 自带滚动接口，真实驱动浏览器滚动到元素中心。
@@ -829,7 +917,9 @@ class ShopeeAuto:
         LOGGER.info("[Shopee][状态等待] 目标=%s，期望=%s，最长 %.1f 秒，xpath=%s", target_name, expected_state, timeout_seconds, xpath)
         while time.monotonic() < deadline:
             self._close_ad_popup(tab, f"等待{target_name}状态时")
-            visible = bool(self._find_action_element(tab, xpath, timeout=1, target_name=target_name))
+            # 状态验证只判断元素是否存在且 displayed，不要求它已经在视口内。
+            # 这样广告页时间按钮可以先被确认出现，再由滚动函数移到屏幕中心。
+            visible = bool(self._find_visible_element(tab, xpath, timeout=1))
             if expected_state == "visible" and visible:
                 LOGGER.info("[Shopee][状态满足] 目标=%s 已出现，耗时 %.2f 秒", target_name, time.monotonic() - started_at)
                 return True
@@ -1039,7 +1129,8 @@ class ShopeeAuto:
 
     def _element_state_matches(self, tab: Any, xpath: str, expected_state: str) -> bool:
         """立即判断元素状态，用于重试前确认上次点击是否延迟生效。"""
-        visible = bool(self._find_action_element(tab, xpath, timeout=0.5, target_name="点击后的页面状态"))
+        # 状态匹配使用 DOM displayed 状态，不把“位于视口之外”误判成“已经消失”。
+        visible = bool(self._find_visible_element(tab, xpath, timeout=0.5))
         if expected_state == "visible":
             return visible
         if expected_state == "hidden":

@@ -28,7 +28,7 @@ ziniao_DailyStoreCheck_codex_two/
 
 ## 3. 核心执行流程
 
-1. `run_daily_store_check.main` 读取 YAML，并调用 `wait_for_schedule` 等待计划时间。
+1. `run_daily_store_check.main` 读取 YAML，默认常驻后台并调用 `wait_for_schedule` 等待每日计划时间；单轮任务异常会记录后继续等待下一次执行。
 2. `DailyStoreCheck.run_once` 调用 `FeishuClient.list_control_tasks`，过滤空开关、暂停和未知平台。
 3. `_prepare_ziniao` 启动紫鸟客户端、更新内核、读取完整店铺列表。
 4. `_run_store` 用控制表店铺名精确匹配紫鸟 `browserName`，得到 `browserOauth` 或 `browserId`。
@@ -48,7 +48,7 @@ ziniao_DailyStoreCheck_codex_two/
 
 - `schedule.run_time`：每日执行时间，格式 `HH:MM`。
 - `schedule.timezone`：时区，默认 `Asia/Shanghai`。
-- `schedule.run_once`：`true` 表示执行后退出，适合 Windows 任务计划程序；`false` 表示进程常驻并每天循环。
+- `schedule.run_once`：`false` 表示启动后常驻并每天循环（默认）；`true` 表示执行一轮后退出，适合由 Windows 任务计划程序负责每天启动。
 - `feishu.app_id/app_secret`：飞书自建应用凭据，也可用环境变量覆盖。
 - `feishu.bitable.control`：控制台多维表的 `app_token + table_id`。
 - `feishu.bitable.data_tables`：三个短期多维表分别填写自己的 `app_token + table_id`。
@@ -112,9 +112,9 @@ ziniao_DailyStoreCheck_codex_two/
 - TikTok 会详细记录页面状态、按钮 XPath、每次点击和重试结果、下一元素等待、弹窗处理，以及每个指标的原始值、转换值和 Python 类型；日志同时显示在控制台并写入 `data/daily_store_check.log`。
 - TikTok 写入飞书时会把广告和概览合并成一条 33 字段记录；公式字段不发送、空数值不发送、日期转换为毫秒时间戳，历史电子表固定使用 33 列顺序。多维表、电子表和机器人最终出站 JSON 以及飞书失败响应都会写入日志，token、密钥和签名自动脱敏。
 - `MKD_auto.py` 接管紫鸟当前标签页并等待初始页面加载完成，按当前网址选择经营指标页后再次等待页面加载，再额外等待 10 秒处理首页广告。所有按钮采用首次点击加 3 次重试，重试间隔至少 2 秒，点击后最多等待 30 秒让下一按钮或数据出现。
-- `SP_auto.py` 先判断“Shopee广告”是否可见；不可见时点击“营销中心”并以“Shopee广告”出现作为展开成功条件，然后进入广告页面。
+- `SP_auto.py` 接管首页后立即检查广告弹窗，页面加载完成后再检查一次；随后判断“Shopee广告”是否可见，不可见时点击“营销中心”并以“Shopee广告”出现作为展开成功条件。
 - Shopee 刚接管紫鸟标签页时会优先检查同时包含 `password` 和 `loginKey` 输入框的登录表单，页面加载后、任何菜单操作前再复查一次；发现该表单便停止当前店铺采集，由紫鸟会话关闭店铺并在关闭确认成功后继续下一店铺。未发现该表单时，仍按 `LOGIN_BUTTON_XPATHS` 的顺序处理其他登录按钮。
-- Shopee 每次打开日期面板前，都会用 DrissionPage 和 JavaScript 双重方式把时间切换按钮滚动到浏览器视口中心，再执行点击和状态验证。元素只有在具备真实宽高、没有被 CSS 隐藏且位于当前视口内时才算可见；日期文字 XPath 命中无尺寸 `span` 时会自动点击最近的 `li/button/a/div` 父节点，最后才回退到 JavaScript `click()`。日期切换必须等到“昨天/最近 7 天”选项出现才认定面板打开成功，选择日期后选项需要连续两次不可见才认定选择成功，随后等待 30 秒再读取 ALL 行指标。
+- Shopee 广告入口采用“首次点击 + 8 次重试”，每次点击后等待约 3 秒确认时间切换按钮出现；未出现时检查广告弹窗再重试。确认进入广告页后只滚动一次时间按钮到视口水平中心线，滚动失败不重试。打开日期面板及选择昨天/最近 7 天也分别采用“首次点击 + 8 次重试”；面板选项未出现时检查弹窗，面板打开和日期切换成功后各单次定位时间按钮。日期选项连续两次不可见才认定选择成功，最终失败会停止当前店铺，避免读取上一时间范围的旧数据。
 - Shopee 采集昨天和最近 7 天各 12 个 ALL 指标。巴西金额如 `R$18.558,26` 转为 `18558.26`，广告支出回报率如 `7,61` 转为 `7.61`；优惠价金额、优惠劵带来销售额使用金额字段（真实飞书表字段使用“劵”字），展示次数、点击数、订单量、商品已出售和加购次数写入数值字段，加购率和点击率按飞书“小数”字段写入去掉百分号后的两位数值；缺失 XPath、元素或无效文本均返回空值并记录原因。
 - Shopee 日志记录菜单可见性判断、每次按钮查找/点击/重试、日期面板出现和消失、指标原始值与转换值及其 Python 类型，以及最终打包 JSON。编排器把 24 项指标合并为一条严格匹配 26 字段多维表的记录；空金额或小数字段不会放入多维表请求体，历史电子表固定按 26 列追加。
 - Shopee 数量字段支持页面缩写，`10.7k`/`10,7k` 转为 `10700`，`1.2m` 转为 `1200000`；不带缩写的 `1.234` 仍按千位分隔转换为 `1234`。
@@ -131,6 +131,7 @@ ziniao_DailyStoreCheck_codex_two/
 - `_safe_notify`：消息推送失败不会阻断下一个店铺。
 - `_extract_all_info_values`：统一提取三个平台的全部指标，空指标也保留在 `ALL_info` 中方便排错。
 - `_send_all_info_summary`：整轮任务末尾调用 DeepSeek 分析非空 `ALL_info`，再把返回 Markdown 通过 interactive 卡片发送给全部 `summary_recipients`。
+- `_print_store_processing_times`：最末尾先打印各店铺耗时字典，再打印包含总时间、TK 总时间、虾皮总时间和美客多总时间的汇总字典；汇总统一使用累计“分钟+秒”格式。
 
 ### `daily_store_check/deepseek_client.py`
 
@@ -141,7 +142,7 @@ ziniao_DailyStoreCheck_codex_two/
 
 - `configure_logging`：控制台和 5 MB 滚动文件日志，保留 5 个备份。
 - `wait_for_schedule`：按配置时区等待每日时间，每 60 秒重新计算一次。
-- `--run-now`：开发阶段立即执行，不等待计划时间。
+- `--run-now`：开发阶段立即执行一轮，不等待计划时间，执行结束后退出；正式后台运行不要添加此参数。
 
 ## 5. 飞书准备清单
 
@@ -185,4 +186,4 @@ python run_daily_store_check.py --run-now
 python run_daily_store_check.py
 ```
 
-无人值守运行推荐让 Windows 任务计划程序每天 07:00 启动，并把 `schedule.enabled` 设为 `false`；程序内置时间等待适合临时常驻方案。两者只选一种，避免重复执行。
+推荐直接启动 `python run_daily_store_check.py` 并保持进程常驻，配置 `schedule.enabled: true`、`schedule.run_time: "07:00"`、`schedule.run_once: false`。若使用 Windows 任务计划程序每天启动一次，则改为 `schedule.run_once: true` 并让任务计划程序负责启动，避免两套调度同时生效。

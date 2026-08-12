@@ -242,12 +242,46 @@ class DailyStoreCheck:
 
     @staticmethod
     def _print_store_processing_times(store_processing_times: dict[str, dict[str, Any]]) -> None:
-        """在整轮程序最末尾只打印店铺名到可读耗时的字典，不写入日志文件。"""
+        """在整轮末尾打印单店铺耗时和四项平台汇总，不写入日志文件。"""
         display_times = {
             store_name: str(details.get("耗时") or "")
             for store_name, details in store_processing_times.items()
         }
         print(json.dumps(display_times, ensure_ascii=False, separators=(",", ":")))
+
+        # 直接累计每间店铺记录的秒数，不从“2分31.51秒”等显示文本反向解析，
+        # 避免字符串格式变化或跨小时后造成统计错误。
+        platform_seconds = {
+            "tiktok": 0.0,
+            "shopee": 0.0,
+            "mercado": 0.0,
+        }
+        total_seconds = 0.0
+        for details in store_processing_times.values():
+            try:
+                elapsed_seconds = max(0.0, float(details.get("耗时秒") or 0))
+            except (TypeError, ValueError):
+                elapsed_seconds = 0.0
+            total_seconds += elapsed_seconds
+            platform = str(details.get("平台") or "").strip().lower()
+            if platform in platform_seconds:
+                platform_seconds[platform] += elapsed_seconds
+
+        summary_times = {
+            "总时间": DailyStoreCheck._format_total_minutes_seconds(total_seconds),
+            "TK总时间": DailyStoreCheck._format_total_minutes_seconds(platform_seconds["tiktok"]),
+            "虾皮总时间": DailyStoreCheck._format_total_minutes_seconds(platform_seconds["shopee"]),
+            "美客多总时间": DailyStoreCheck._format_total_minutes_seconds(platform_seconds["mercado"]),
+        }
+        print(json.dumps(summary_times, ensure_ascii=False, separators=(",", ":")))
+
+    @staticmethod
+    def _format_total_minutes_seconds(elapsed_seconds: float) -> str:
+        """把汇总秒数转换为累计“分钟+秒”；超过一小时也不改成小时格式。"""
+        safe_seconds = max(0.0, float(elapsed_seconds))
+        total_minutes = int(safe_seconds // 60)
+        seconds = safe_seconds % 60
+        return f"{total_minutes}分{seconds:.2f}秒"
 
     def _prepare_ziniao(self) -> None:
         """启动紫鸟、更新内核并缓存全部店铺信息。"""

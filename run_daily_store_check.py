@@ -1,7 +1,7 @@
 """每日店铺检查程序入口。
 
-正式运行：python run_daily_store_check.py
-立即测试：python run_daily_store_check.py --run-now
+正式运行（常驻后台，每天按配置时间执行）：python run_daily_store_check.py
+立即测试（执行一轮后退出）：python run_daily_store_check.py --run-now
 """
 
 from __future__ import annotations
@@ -59,19 +59,25 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    """加载配置并按 run_once 决定执行一次或每天循环。"""
+    """加载配置并常驻等待每日时间；--run-now 仅用于执行一轮后退出。"""
     args = parse_args()
     config = load_config(args.config)
     configure_logging(config)
     schedule = config.get("schedule", {})
     while True:
         wait_for_schedule(schedule, args.run_now)
-        DailyStoreCheck(config).run_once()
-        if schedule.get("run_once", True) or args.run_now:
+        try:
+            DailyStoreCheck(config).run_once()
+        except Exception:
+            # 单日任务的未预期异常不能杀死常驻调度进程；记录完整堆栈后等待下一天。
+            logging.getLogger(__name__).exception("本轮每日店铺检查发生未处理异常，程序继续常驻等待下一次执行")
+
+        # --run-now 明确表示手动测试，只执行当前这一轮；正式常驻模式由 run_once=false 控制。
+        if schedule.get("run_once", False) or args.run_now:
             return 0
+        logging.info("本轮每日店铺检查结束，程序继续后台常驻，等待下一次执行时间")
         args.run_now = False
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
