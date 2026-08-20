@@ -18,6 +18,7 @@ import random
 import re
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 import requests
@@ -28,7 +29,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 # TikTok 登录入口和登录后的状态标记。
-# 不等待页面完全就绪；登录入口出现时先处理登录，登录阶段不关闭其他弹窗或验证码。
+# 业务入口出现时不等待整页；首次发现登录入口时等待页面完成和复查缓冲时间，再决定是否登录。
 LOGIN_EMAIL_PANEL_BUTTON_XPATH = '//span[@id="TikTok_Ads_SSO_Login_Email_Panel_Button"]'
 LOGIN_EMAIL_SELECTED_XPATH = (
     '//span[@id="TikTok_Ads_SSO_Login_Email_Panel_Button" '
@@ -43,6 +44,8 @@ CAPTCHA_IMAGE_XPATH = '//img[@alt="captchaOpti_hCaptchaModal1_header"]'
 CAPTCHA_CONFIRM_BUTTON_XPATH = '//button[normalize-space(.)="确认"]'
 # 单次识别或提交失败后的额外重试次数；值为 2 表示最多处理 3 张验证码图片。
 CAPTCHA_SOLVE_RETRY_TIMES = 2
+# 同一张验证码图片连续请求视觉模型的次数。五次坐标分别求平均后再点击，降低单次识别的位置误差。
+CAPTCHA_RECOGNITION_SAMPLE_COUNT = 5
 # 点击验证码确认按钮后，等待业务菜单、验证码消失或验证码图片更新的最长秒数。
 CAPTCHA_SUBMIT_RESULT_TIMEOUT_SECONDS = 15
 # 登录按钮提交后，等待业务菜单、手机号错误或验证码出现的最长秒数。
@@ -67,9 +70,13 @@ VERIFY_BAR_CLOSE_XPATH = '//a[@id="verify-bar-close"]'
 # 页面入口和按钮操作参数。
 # 不再等待 document.readyState=complete；这里只限制登录后等待营销/店铺广告按钮出现的最长秒数。
 ENTRY_ELEMENT_TIMEOUT_SECONDS = 60
-# 登录入口必须连续可见的秒数；达到该时间才判定未登录，短暂闪现不会触发登录流程。
-LOGIN_PANEL_STABLE_SECONDS = 5
-# 检测登录入口的最长总秒数；到期仍未连续可见满稳定时间时，按已经登录继续执行。
+# 首次发现登录入口后，等待 document.readyState=complete 的最长秒数。
+LOGIN_PAGE_READY_TIMEOUT_SECONDS = 60
+# 页面达到 complete 后继续观察三个入口的最长秒数，给业务菜单的延迟渲染留出时间。
+LOGIN_RECHECK_TIMEOUT_SECONDS = 60
+# 等待页面完成和页面完成后的观察阶段中，重新检查三个入口的时间间隔。
+LOGIN_RECHECK_INTERVAL_SECONDS = 2
+# 首次同时检测登录入口、营销按钮和店铺广告按钮的最长总秒数。
 LOGIN_DETECTION_TIMEOUT_SECONDS = 10
 # 单个按钮首次点击失败后的额外重试次数；值为 3 时最多执行 1 次首次点击加 3 次重试。
 CLICK_RETRY_TIMES = 3
@@ -668,53 +675,185 @@ class TiktokAuto:
                 field_values.pop(amount_field, None)
 
     def _is_login_required(self, tab: Any) -> bool:
-        """不等待整页完成；业务菜单出现时立即按已登录处理，否则观察登录入口。"""
+        """首次发现登录入口后分两阶段复查；任一阶段出现业务入口都立即判定已登录。"""
         started_at = time.monotonic()
         deadline = started_at + LOGIN_DETECTION_TIMEOUT_SECONDS
-        continuously_visible_since: float | None = None
         LOGGER.info(
-            "[TikTok][入口检测] 同时检查登录入口、营销按钮和店铺广告按钮；登录入口连续可见 %.1f 秒才判定未登录，最长观察 %.1f 秒",
-            LOGIN_PANEL_STABLE_SECONDS,
+            "[TikTok][入口检测] 同时检查登录入口、营销按钮和店铺广告按钮，最长观察 %.1f 秒",
             LOGIN_DETECTION_TIMEOUT_SECONDS,
         )
 
         while time.monotonic() < deadline:
             login_entry = self._find_visible_element(tab, LOGIN_EMAIL_PANEL_BUTTON_XPATH, timeout=0.5)
-            now = time.monotonic()
+            navigation_name = self._main_navigation_name(tab)
+
+            # 三个入口可能在页面切换时短暂同时存在，业务入口优先，避免误进登录流程。
+            if navigation_name:
+                LOGGER.info(
+                    "[TikTok][入口检测成功] 已发现%s，确认当前店铺已经登录，不等待 document.readyState",
+                    navigation_name,
+                )
+                return False
+
             if login_entry:
-                if continuously_visible_since is None:
-                    continuously_visible_since = now
-                    LOGGER.warning("[TikTok][登录检测] 发现邮箱登录入口，开始连续计时")
-                visible_seconds = now - continuously_visible_since
-                if visible_seconds >= LOGIN_PANEL_STABLE_SECONDS:
-                    LOGGER.warning(
-                        "[TikTok][登录检测] 邮箱登录入口已连续可见 %.2f 秒，确认当前店铺未登录",
-                        visible_seconds,
-                    )
-                    return True
-            else:
-                navigation_name = self._main_navigation_name(tab)
-                if navigation_name:
-                    LOGGER.info(
-                        "[TikTok][入口检测成功] 未发现登录入口且已发现%s，不等待 document.readyState，立即按已登录状态继续",
-                        navigation_name,
-                    )
+                LOGGER.warning(
+                    "[TikTok][登录检测] 首次发现邮箱登录入口；最多等待页面完成 %.1f 秒，"
+                    "期间每 %.1f 秒复查三个入口",
+                    LOGIN_PAGE_READY_TIMEOUT_SECONDS,
+                    LOGIN_RECHECK_INTERVAL_SECONDS,
+                )
+                page_wait_result = self._wait_for_document_or_navigation(
+                    tab,
+                    LOGIN_PAGE_READY_TIMEOUT_SECONDS,
+                    LOGIN_RECHECK_INTERVAL_SECONDS,
+                )
+                if page_wait_result == "navigation":
                     return False
-                if continuously_visible_since is not None:
-                    LOGGER.info(
-                        "[TikTok][登录检测] 登录入口连续出现 %.2f 秒后消失，未达到 %.1f 秒，重新计时",
-                        now - continuously_visible_since,
-                        LOGIN_PANEL_STABLE_SECONDS,
+                if page_wait_result != "complete":
+                    raise TimeoutError(
+                        f"TikTok 首次发现登录入口后，页面在 {LOGIN_PAGE_READY_TIMEOUT_SECONDS:.0f} 秒内未加载完成"
                     )
-                continuously_visible_since = None
+
+                LOGGER.info(
+                    "[TikTok][登录复查等待] 页面已加载完成；继续观察最长 %.1f 秒，"
+                    "每 %.1f 秒重新检查登录入口、营销按钮和店铺广告按钮",
+                    LOGIN_RECHECK_TIMEOUT_SECONDS,
+                    LOGIN_RECHECK_INTERVAL_SECONDS,
+                )
+                return self._observe_login_entries_after_complete(
+                    tab,
+                    LOGIN_RECHECK_TIMEOUT_SECONDS,
+                    LOGIN_RECHECK_INTERVAL_SECONDS,
+                )
 
             # 登录判断完成前只移动鼠标，不允许关闭验证码或首页弹窗。
             self._human_wait(tab, 0.5, check_interruptions=False)
 
         LOGGER.info(
-            "[TikTok][登录检测] 观察 %.2f 秒未发现连续可见满 %.1f 秒的登录入口，按已登录状态继续",
+            "[TikTok][登录检测] 观察 %.2f 秒仍没有明确入口，暂不执行登录，继续由业务入口等待流程确认",
             time.monotonic() - started_at,
-            LOGIN_PANEL_STABLE_SECONDS,
+        )
+        return False
+
+    def _wait_for_document_or_navigation(
+        self,
+        tab: Any,
+        timeout_seconds: float,
+        check_interval_seconds: float,
+    ) -> str:
+        """等待页面 complete，同时定期复查业务入口；返回 complete、navigation 或 timeout。"""
+        started_at = time.monotonic()
+        deadline = started_at + max(0.0, timeout_seconds)
+        check_count = 0
+        LOGGER.info(
+            "[TikTok][页面加载等待] 最长 %.1f 秒等待 document.readyState=complete，"
+            "每 %.1f 秒复查三个入口，业务入口出现时立即结束等待",
+            timeout_seconds,
+            check_interval_seconds,
+        )
+        while True:
+            check_count += 1
+            login_entry = self._find_visible_element(tab, LOGIN_EMAIL_PANEL_BUTTON_XPATH, timeout=0.5)
+            navigation_name = self._main_navigation_name(tab)
+            try:
+                ready_state = str(tab.run_js("return document.readyState;") or "").strip().lower()
+            except Exception as exc:
+                ready_state = ""
+                LOGGER.warning(
+                    "[TikTok][页面加载检查异常] 第 %s 次读取 document.readyState 失败，异常=%s",
+                    check_count,
+                    exc,
+                )
+
+            LOGGER.info(
+                "[TikTok][页面加载阶段复查] 第 %s 次，登录入口=%s，业务入口=%s，readyState=%r",
+                check_count,
+                "可见" if login_entry else "不可见",
+                navigation_name or "未发现",
+                ready_state or "未知",
+            )
+            if navigation_name:
+                LOGGER.info(
+                    "[TikTok][入口检测成功] 页面尚在加载或刚完成时已发现%s，立即确认当前店铺已经登录",
+                    navigation_name,
+                )
+                return "navigation"
+            if ready_state == "complete":
+                LOGGER.info(
+                    "[TikTok][页面加载完成] 第 %s 次检查确认 document.readyState=complete，耗时 %.2f 秒",
+                    check_count,
+                    time.monotonic() - started_at,
+                )
+                return "complete"
+
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                break
+            self._human_wait(
+                tab,
+                min(max(0.1, check_interval_seconds), remaining_seconds),
+                check_interruptions=False,
+            )
+
+        LOGGER.error(
+            "[TikTok][页面加载超时] 等待 %.1f 秒仍未达到 document.readyState=complete",
+            timeout_seconds,
+        )
+        return "timeout"
+
+    def _observe_login_entries_after_complete(
+        self,
+        tab: Any,
+        timeout_seconds: float,
+        check_interval_seconds: float,
+    ) -> bool:
+        """页面完成后定期复查三个入口；业务入口优先，超时后才根据登录入口决定是否登录。"""
+        started_at = time.monotonic()
+        deadline = started_at + max(0.0, timeout_seconds)
+        check_count = 0
+        login_entry_visible = False
+
+        while True:
+            check_count += 1
+            login_entry_visible = bool(
+                self._find_visible_element(tab, LOGIN_EMAIL_PANEL_BUTTON_XPATH, timeout=0.5)
+            )
+            navigation_name = self._main_navigation_name(tab)
+            LOGGER.info(
+                "[TikTok][登录复查] 第 %s 次，耗时 %.2f 秒，登录入口=%s，业务入口=%s",
+                check_count,
+                time.monotonic() - started_at,
+                "可见" if login_entry_visible else "不可见",
+                navigation_name or "未发现",
+            )
+
+            if navigation_name:
+                LOGGER.info(
+                    "[TikTok][入口检测成功] 复查期间发现%s，不再等待，确认当前店铺已经登录",
+                    navigation_name,
+                )
+                return False
+
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                break
+            self._human_wait(
+                tab,
+                min(max(0.1, check_interval_seconds), remaining_seconds),
+                check_interruptions=False,
+            )
+
+        if login_entry_visible:
+            LOGGER.warning(
+                "[TikTok][登录检测确认] 页面完成后观察 %.1f 秒仍只发现邮箱登录入口，确认当前店铺未登录",
+                timeout_seconds,
+            )
+            return True
+
+        LOGGER.warning(
+            "[TikTok][登录复查结束] 观察 %.1f 秒后三个入口均未发现，暂不执行登录，"
+            "继续由业务入口等待流程确认",
+            timeout_seconds,
         )
         return False
 
@@ -840,7 +979,7 @@ class TiktokAuto:
                     if not screenshot:
                         raise RuntimeError("TikTok 验证码元素截图失败") from image_exc
                     image_base64, image_width, image_height = self._image_bytes_to_jpeg_base64(bytes(screenshot))
-                point1, point2, raw_reply = self._call_qwen_captcha(
+                point1, point2, recognition_results = self._recognise_captcha_average(
                     api_key,
                     endpoint,
                     model,
@@ -850,14 +989,15 @@ class TiktokAuto:
                     image_height,
                 )
                 LOGGER.info(
-                    "[TikTok][验证码识别成功] 第 %s/%s 次，原图尺寸=%sx%s，p1=%s，p2=%s，模型原始返回=%r",
+                    "[TikTok][验证码识别成功] 第 %s/%s 次，原图尺寸=%sx%s，五次识别结果=%s，"
+                    "四舍五入后的平均坐标 p1=%s，p2=%s",
                     attempt + 1,
                     max_attempts,
                     image_width,
                     image_height,
+                    json.dumps(recognition_results, ensure_ascii=False),
                     point1,
                     point2,
-                    raw_reply,
                 )
 
                 # 模型请求期间验证码可能自动刷新；刷新后旧图片坐标不得继续使用。
@@ -895,6 +1035,68 @@ class TiktokAuto:
                 self._human_wait(tab, CLICK_RETRY_INTERVAL_SECONDS, check_interruptions=False)
 
         raise RuntimeError(f"TikTok 物体匹配验证码连续 {max_attempts} 次处理失败")
+
+    @classmethod
+    def _recognise_captcha_average(
+        cls,
+        api_key: str,
+        endpoint: str,
+        model: str,
+        timeout_seconds: float,
+        image_base64: str,
+        image_width: int,
+        image_height: int,
+    ) -> tuple[tuple[int, int], tuple[int, int], list[dict[str, Any]]]:
+        """对同一张图片识别五次，分别计算 p1/p2 横纵坐标的四舍五入平均值。"""
+        recognition_results: list[dict[str, Any]] = []
+        for sample_index in range(CAPTCHA_RECOGNITION_SAMPLE_COUNT):
+            point1, point2, raw_reply = cls._call_qwen_captcha(
+                api_key,
+                endpoint,
+                model,
+                timeout_seconds,
+                image_base64,
+                image_width,
+                image_height,
+            )
+            current_result = {
+                "p1": [point1[0], point1[1]],
+                "p2": [point2[0], point2[1]],
+            }
+            recognition_results.append(current_result)
+            LOGGER.info(
+                "[TikTok][验证码模型采样] 第 %s/%s 次识别成功，坐标=%s，模型原始返回=%r",
+                sample_index + 1,
+                CAPTCHA_RECOGNITION_SAMPLE_COUNT,
+                json.dumps(current_result, ensure_ascii=False),
+                raw_reply,
+            )
+
+        point1_average = (
+            cls._round_coordinate_average(result["p1"][0] for result in recognition_results),
+            cls._round_coordinate_average(result["p1"][1] for result in recognition_results),
+        )
+        point2_average = (
+            cls._round_coordinate_average(result["p2"][0] for result in recognition_results),
+            cls._round_coordinate_average(result["p2"][1] for result in recognition_results),
+        )
+        LOGGER.info(
+            "[TikTok][验证码坐标平均] 样本数=%s，全部坐标=%s，最终 p1=%s，最终 p2=%s",
+            len(recognition_results),
+            json.dumps(recognition_results, ensure_ascii=False),
+            point1_average,
+            point2_average,
+        )
+        return point1_average, point2_average, recognition_results
+
+    @staticmethod
+    def _round_coordinate_average(values: Any) -> int:
+        """使用十进制 ROUND_HALF_UP 求坐标平均值，确保小数部分为 .5 时向上取整。"""
+        decimal_values = [Decimal(str(value)) for value in values]
+        if not decimal_values:
+            raise ValueError("验证码坐标平均值缺少样本")
+        average = sum(decimal_values, Decimal("0")) / Decimal(len(decimal_values))
+        return int(average.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
     @staticmethod
     def _read_captcha_image_bytes(captcha_img: Any, image_src: str, timeout_seconds: float) -> bytes:
