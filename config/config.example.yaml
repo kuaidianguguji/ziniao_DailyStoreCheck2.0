@@ -13,12 +13,12 @@ ziniao:
     username: ""
     password: ""
 
-# 启动后常驻后台，每天等待到 07:00 执行；使用 --run-now 可立即执行一轮并退出。
+# 启动后常驻后台，每天等待到 07:00 执行；--run-now 会立即执行第一轮并继续常驻。
 schedule:
   enabled: true
   run_time: "07:00"
   timezone: "Asia/Shanghai"
-  # false=执行完成后继续常驻，true=执行一轮后退出（适合外部任务计划程序）。
+  # false=执行完成后等待第二天继续运行，true=执行一轮后退出（适合外部任务计划程序）。
   run_once: false
 
 feishu:

@@ -5,12 +5,13 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import re
 import time
 import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
-from .config import StoreTask
+from .config import StoreTask, normalise_platform
 from .deepseek_client import DeepSeekClient
 from .feishu_client import FeishuClient
 from .ziniao_client import ZiniaoClient, ZiniaoStoreCloseError, ZiniaoStoreSession
@@ -298,7 +299,7 @@ class DailyStoreCheck:
             "采集时间": "",
             "数据": {},
         }
-        identifier = task.browser_oauth or task.browser_id or self._find_browser_identifier(task.store_name)
+        identifier = task.browser_oauth or task.browser_id or self._find_browser_identifier(task.store_name, task.platform)
         if not identifier:
             LOGGER.error("找不到店铺 %s 对应的紫鸟 browserOauth/browserId，跳过", task.store_name)
             error_message = "没有找到紫鸟店铺标识，请检查店铺名是否与紫鸟一致。"
@@ -412,13 +413,104 @@ class DailyStoreCheck:
         except Exception:
             LOGGER.exception("飞书 Markdown 消息推送失败 recipient=%s", recipient)
 
-    def _find_browser_identifier(self, store_name: str) -> str:
-        """按店铺名匹配紫鸟店铺，优先 browserOauth。"""
-        wanted = str(store_name).strip().casefold()
+    def _find_browser_identifier(self, store_name: str, platform: str = "") -> str:
+        """按店铺名查找紫鸟标识，先精确匹配，再按“平台+店号”匹配。"""
+        wanted_name = self._normalise_store_name(store_name)
+        wanted_key = self._build_platform_store_key(store_name, platform)
+        LOGGER.info(
+            "[紫鸟][店铺匹配] 控制表名称=%r，平台=%r，精确名称=%r，平台店号键=%r",
+            store_name,
+            platform,
+            wanted_name,
+            wanted_key or "<无法提取>",
+        )
+
+        # 如果名称完全一致，优先使用原来的精确匹配行为。
         for browser in self.browser_list:
-            name = str(browser.get("browserName") or browser.get("name") or "").strip().casefold()
-            if name == wanted:
-                return str(browser.get("browserOauth") or browser.get("browserId") or "")
+            browser_name = str(browser.get("browserName") or browser.get("name") or "").strip()
+            if self._normalise_store_name(browser_name) != wanted_name:
+                continue
+            identifier = str(browser.get("browserOauth") or browser.get("browserId") or "")
+            if identifier:
+                LOGGER.info("[紫鸟][店铺精确匹配成功] 控制表=%r，紫鸟名称=%r，标识=%s", store_name, browser_name, identifier)
+                return identifier
+
+        if not wanted_key:
+            LOGGER.warning("[紫鸟][店铺匹配失败] 名称=%r 无法提取平台+店号", store_name)
+            return ""
+
+        # 紫鸟名称可能带公司名、空格、末尾“店”等附加内容，只比较规范化后的平台+店号键。
+        candidates: list[tuple[str, dict[str, Any]]] = []
+        for browser in self.browser_list:
+            browser_name = str(browser.get("browserName") or browser.get("name") or "").strip()
+            browser_key = self._build_platform_store_key(browser_name, platform)
+            if browser_key == wanted_key:
+                candidates.append((browser_name, browser))
+
+        if not candidates:
+            LOGGER.warning("[紫鸟][店铺平台店号匹配失败] 控制表=%r，平台店号键=%s", store_name, wanted_key)
+            return ""
+
+        if len(candidates) > 1:
+            LOGGER.warning(
+                "[紫鸟][店铺平台店号匹配歧义] 控制表=%r，键=%s，候选=%s；采用第一个候选",
+                store_name,
+                wanted_key,
+                [name for name, _ in candidates],
+            )
+
+        # 某些紫鸟列表项可能只有展示名称没有可用 browserOauth/browserId，跳过这类候选，
+        # 避免它排在前面时遮挡后面真正可打开的同键店铺。
+        valid_candidates = [
+            (name, browser)
+            for name, browser in candidates
+            if str(browser.get("browserOauth") or browser.get("browserId") or "")
+        ]
+        if not valid_candidates:
+            LOGGER.warning("[紫鸟][店铺平台店号匹配失败] 键=%s 的候选都没有 browserOauth/browserId", wanted_key)
+            return ""
+
+        browser_name, browser = valid_candidates[0]
+        identifier = str(browser.get("browserOauth") or browser.get("browserId") or "")
+        if identifier:
+            LOGGER.info(
+                "[紫鸟][店铺平台店号匹配成功] 控制表=%r -> 紫鸟名称=%r，键=%s，标识=%s",
+                store_name,
+                browser_name,
+                wanted_key,
+                identifier,
+            )
+        return identifier
+
+    @staticmethod
+    def _normalise_store_name(store_name: Any) -> str:
+        """统一店铺名称的 Unicode、大小写和空白，用于精确名称比较。"""
+        value = unicodedata.normalize("NFKC", str(store_name or "")).strip().casefold()
+        return re.sub(r"\s+", "", value)
+
+    @staticmethod
+    def _build_platform_store_key(store_name: Any, platform: str = "") -> str:
+        """从任意店铺名中提取稳定的 ``平台:店号`` 键。"""
+        value = unicodedata.normalize("NFKC", str(store_name or "")).strip().casefold()
+        # 与控制表读取阶段共用平台别名规则，兼容 tk/sp/mkd/meicado 等写法。
+        platform_value = normalise_platform(unicodedata.normalize("NFKC", str(platform or "")).strip())
+        patterns: dict[str, tuple[str, ...]] = {
+            "tiktok": (r"(?:tiktok|tk)\s*[-_#]?\s*0*(\d+)",),
+            "shopee": (r"(?:shopee|虾皮)\s*[-_#]?\s*0*(\d+)",),
+            "mercado": (r"(?:mercado(?:\s*libre)?|美客多)\s*[-_#]?\s*0*(\d+)",),
+        }
+        selected_patterns = patterns.get(platform_value, ())
+        if not selected_patterns:
+            # platform 为空或使用了未知别名时，按所有平台尝试；正常控制表任务都会带平台字段。
+            selected_patterns = tuple(pattern for group in patterns.values() for pattern in group)
+
+        for pattern in selected_patterns:
+            match = re.search(pattern, value, flags=re.IGNORECASE)
+            if match:
+                store_number = str(int(match.group(1)))
+                for platform_key, platform_patterns in patterns.items():
+                    if pattern in platform_patterns:
+                        return f"{platform_key}:{store_number}"
         return ""
 
     def _load_crawler(self, platform: str) -> Any:

@@ -31,7 +31,7 @@ ziniao_DailyStoreCheck_codex_two/
 1. `run_daily_store_check.main` 读取 YAML，默认常驻后台并调用 `wait_for_schedule` 等待每日计划时间；单轮任务异常会记录后继续等待下一次执行。
 2. `DailyStoreCheck.run_once` 调用 `FeishuClient.list_control_tasks`，过滤空开关、暂停和未知平台。
 3. `_prepare_ziniao` 启动紫鸟客户端、更新内核、读取完整店铺列表。
-4. `_run_store` 用控制表店铺名精确匹配紫鸟 `browserName`，得到 `browserOauth` 或 `browserId`。
+4. `_run_store` 先用控制表店铺名精确匹配紫鸟 `browserName`；精确名称不一致时，按控制表平台和名称中的店号生成“平台+店号”键，再匹配紫鸟名称中的同一平台和店号，得到 `browserOauth` 或 `browserId`。
 5. `ZiniaoStoreSession` 严格调用官方 `startBrowser` 打开一间店铺，连接 WebDriver，完成 `ipDetectionPage` 检测后打开 `launcherPage`；当前紫鸟 V6 环境中先 `driver.quit` 会使 16851 IPC 失联，因此 `with` 结束时先调用官方 `stopBrowser` 确认关闭店铺，再清理 WebDriver 会话。
 6. `_load_crawler` 根据配置动态载入 `TK_auto.py`、`SP_auto.py` 或 `MKD_auto.py`。
 7. 爬虫优先用 DrissionPage 连接紫鸟的 `debuggingPort`，输出统一结构。
@@ -124,7 +124,7 @@ ziniao_DailyStoreCheck_codex_two/
 ### `daily_store_check/orchestrator.py`
 
 - `run_once`：一轮完整任务，唯一店铺循环位于这里，未使用线程池。
-- `_find_browser_identifier`：控制表店铺名与紫鸟店铺名大小写无关的精确匹配。
+- `_find_browser_identifier`：先执行 Unicode/空白归一化后的精确匹配；失败后提取 `tiktok/TK`、`shopee/虾皮`、`mercado/美客多`及店号，按“平台:店号”匹配，支持公司名前缀、空格和末尾“店”等紫鸟名称差异。
 - `_load_crawler`：动态加载平台类，新增平台时不需要修改循环逻辑。
 - `_write_feishu`：一份标准爬虫结果同时转换为多维表记录和电子表行。
 - `_cleanup_retention`：只清理短期多维表。
@@ -141,8 +141,9 @@ ziniao_DailyStoreCheck_codex_two/
 ### `run_daily_store_check.py`
 
 - `configure_logging`：控制台和 5 MB 滚动文件日志，保留 5 个备份。
-- `wait_for_schedule`：按配置时区等待每日时间，每 60 秒重新计算一次。
-- `--run-now`：开发阶段立即执行一轮，不等待计划时间，执行结束后退出；正式后台运行不要添加此参数。
+- `wait_for_schedule`：按配置时区等待每日时间，每 60 秒重新计算一次；一轮完成后即使当前仍早于当天计划时间，也会等待到第二天，避免同一天重复运行。
+- `--run-now`：立即执行第一轮，完成后不退出，继续常驻等待第二天的计划时间。
+- `--once`：明确要求执行一轮后退出；临时测试通常组合使用 `--run-now --once`。
 
 ## 5. 飞书准备清单
 
@@ -171,7 +172,7 @@ feishu:
 1. 给自建应用开放多维表读写、电子表读写和机器人发消息权限，并发布应用版本。
 2. 把应用机器人加入需要发送消息的可见范围。
 3. 控制台“推送人员”必须使用飞书“人员”字段。接口会从人员字段返回值中读取 `open_id`/`user_id`，不会把姓名文本猜成用户 ID。
-4. 控制台店铺名必须与紫鸟 `browserName` 完全一致。
+4. 控制台店铺名固定填写平台+店号，例如 `美客多11`、`TK3`、`虾皮5`；紫鸟名称可以包含公司名前缀、空格或末尾“店”，程序会按平台+店号匹配。
 5. 当前 `robot.receive_id_type` 为 `open_id`；最终汇总接收人在 `robot.summary_recipients` 中按 `姓名: ou_xxx` 填写。字典为空时不发送 DeepSeek 分析结果。
 6. TikTok、Shopee、美客多短期表分别严格使用项目定义的 33、26、32 个字段；不要再为 Shopee 创建通用的“指标/数值/原始数据”字段。
 7. 多维表“采集时间”使用日期字段，程序写入前统一转换为毫秒时间戳。
@@ -182,7 +183,7 @@ feishu:
 ```powershell
 pip install -r requirements-daily.txt
 Copy-Item config/config.example.yaml config/config.yaml
-python run_daily_store_check.py --run-now
+python run_daily_store_check.py --run-now --once
 python run_daily_store_check.py
 ```
 

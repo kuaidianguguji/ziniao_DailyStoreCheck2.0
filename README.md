@@ -66,7 +66,14 @@ python ziniao_webdriver_demo.py
 ```powershell
 pip install -r requirements-daily.txt
 Copy-Item config/config.example.yaml config/config.yaml
+# 正式运行：进程常驻，每天按 config.yaml 的时间执行。
+python run_daily_store_check.py
+
+# 立即执行第一轮，完成后仍常驻并等待第二天。
 python run_daily_store_check.py --run-now
+
+# 仅用于临时测试：立即执行一轮后退出。
+python run_daily_store_check.py --run-now --once
 ```
 
 ## 扩展脚本
