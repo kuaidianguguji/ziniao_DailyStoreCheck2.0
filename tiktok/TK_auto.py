@@ -1,7 +1,7 @@
 """TikTok 店铺广告和数据分析自动化。
 
-本文件独立维护 TikTok 的 DrissionPage 连接、按钮点击、XPath、数值解析和飞书字段。
-程序只接管紫鸟已经打开的当前标签页，不会主动访问任何网址。
+本文件独立维护 TikTok 的 DrissionPage 连接、页面跳转、按钮点击、XPath、数值解析和飞书字段。
+程序只接管紫鸟已经打开的当前标签页，并在该标签页中访问固定的广告页和数据概览页，复用紫鸟店铺登录态。
 
 所有按钮和指标 XPath 都集中维护在本文件顶部，方便单独调整 TikTok 流程；
 以后新增 XPath 时，如果 XPath 为空、元素不存在或读取失败，仍默认返回空值，不会中断其他步骤和指标。
@@ -67,22 +67,21 @@ CAPTCHA_QWEN_PROMPT = """
 HOME_DIALOG_CLOSE_XPATH = '//div[@role="dialog"]//span[contains(@class,"core-modal-close-icon")]'
 VERIFY_BAR_CLOSE_XPATH = '//a[@id="verify-bar-close"]'
 
-# 页面入口和按钮操作参数。
-# 不再等待 document.readyState=complete；这里只限制登录后等待营销/店铺广告按钮出现的最长秒数。
-ENTRY_ELEMENT_TIMEOUT_SECONDS = 60
-# 首次发现登录入口后，等待 document.readyState=complete 的最长秒数。
-LOGIN_PAGE_READY_TIMEOUT_SECONDS = 60
-# 页面达到 complete 后继续观察三个入口的最长秒数，给业务菜单的延迟渲染留出时间。
-LOGIN_RECHECK_TIMEOUT_SECONDS = 60
-# 等待页面完成和页面完成后的观察阶段中，重新检查三个入口的时间间隔。
-LOGIN_RECHECK_INTERVAL_SECONDS = 2
-# 首次同时检测登录入口、营销按钮和店铺广告按钮的最长总秒数。
-LOGIN_DETECTION_TIMEOUT_SECONDS = 10
+# 页面和按钮操作参数。
+# 首次发现登录入口后，等待多少秒再重新检查登录入口和四类已登录标志；后续可直接调整。
+LOGIN_RECHECK_WAIT_SECONDS = 5
+# 页面跳转后、数据标志出现前的最长等待时间。
+PAGE_READY_TIMEOUT_SECONDS = 60
+# 每次点击时间按钮或日期按钮后，最多等待多少秒确认状态；超时才进入重试。
+# 用户要求所有按钮点击后的状态等待统一使用这个变量。
+TK_STEP_WAIT_SECONDS = 5
+# 页面日期切换后，等待 document.readyState=complete 的最长时间。
+DATA_PAGE_READY_TIMEOUT_SECONDS = 60
 # 单个按钮首次点击失败后的额外重试次数；值为 3 时最多执行 1 次首次点击加 3 次重试。
 CLICK_RETRY_TIMES = 3
 # 同一按钮相邻两次重试之间的基础等待秒数；实际还会随机增加 0 至 1 秒。
 CLICK_RETRY_INTERVAL_SECONDS = 2
-# 点击按钮后等待成功标志、下一按钮、面板或首个数据指标出现的最长秒数。
+# 通用旧按钮流程的最长等待时间；固定页面的新日期流程使用 TK_STEP_WAIT_SECONDS。
 NEXT_ELEMENT_TIMEOUT_SECONDS = 30
 # 数据加载完成标志首次未出现后允许的重查次数；值为 5 表示最多额外检查 5 次。
 DATA_READY_RETRY_TIMES = 5
@@ -100,6 +99,13 @@ HUMAN_PRE_CLICK_PAUSE_MIN_SECONDS = 0.5
 # 本店铺首次点击前、以及按钮滚动到视口中心后的随机停留最大秒数。
 HUMAN_PRE_CLICK_PAUSE_MAX_SECONDS = 1.2
 
+# 确认店铺已经登录后，在紫鸟当前标签页中直接访问两个固定业务页面。
+# 页面跳转不会创建新浏览器，也不会脱离紫鸟店铺环境。
+AD_PAGE_URL = "https://seller-br.tiktok.com/ads-creation/dashboard"
+OVERVIEW_PAGE_URL = "https://seller-br.tiktok.com/compass/data-overview"
+# 跳转后等待目标页面时间控件出现的最长秒数；时间控件出现后才开始日期切换。
+BUSINESS_PAGE_ENTRY_TIMEOUT_SECONDS = TK_STEP_WAIT_SECONDS
+
 # ---------------------------------------------------------------------------
 # 一、店铺广告流程
 # ---------------------------------------------------------------------------
@@ -113,28 +119,6 @@ AD_7_DAYS_BUTTON_XPATH = '//button[contains(@class,"theme-arco-btn") and contain
 # 广告页面数据加载完成标志。该指标可见才表示广告页或切换后的日期数据已经加载完成。
 # 后续页面结构变化时，只需要在这里替换成任意一个可靠的广告指标 XPath。
 AD_DATA_READY_XPATH = '//div[normalize-space(.)="成本"]/ancestor::div[contains(@class,"overview-item")]//span[starts-with(@class,"overview-item-value-")][contains(.,"USD")]'
-
-
-# 如果“店铺广告”已经可见，营销菜单已经展开，不再点击营销按钮，避免把菜单重新收起。
-# 点击“店铺广告”后必须看见广告指标，才确认页面数据已经加载，可以继续操作日期。
-AD_COMMON_CLICK_STEPS: list[dict[str, Any]] = [
-    {
-        "name": "点击营销按钮",
-        "xpath": AD_MARKETING_BUTTON_XPATH,
-        "wait_seconds": 1,
-        "success_xpath": AD_STORE_BUTTON_XPATH,
-        "success_state": "visible",
-        "success_name": "店铺广告按钮已经可见",
-    },
-    {
-        "name": "点击店铺广告",
-        "xpath": AD_STORE_BUTTON_XPATH,
-        "wait_seconds": 2,
-        "success_xpath": AD_DATA_READY_XPATH,
-        "success_state": "visible",
-        "success_name": "广告页成本指标已经可见",
-    },
-]
 
 
 # 店铺广告时间范围切换步骤。每个时间范围都预留“打开时间”和“选择范围”两次点击。
@@ -198,35 +182,12 @@ AD_METRIC_SPECS: list[dict[str, str]] = [
 # ---------------------------------------------------------------------------
 
 # 概览流程按钮 XPath。日期选项不可见时，会重新点击时间按钮并等待相应选项出现。
-OVERVIEW_ANALYTICS_BUTTON_XPATH = '//div[@class="p-menu-inline"]//div[@class="p-menu-item-title-txt"][normalize-space(.)="数据分析"]'
-OVERVIEW_PAGE_BUTTON_XPATH = '//span[contains(@class,"text-base") and contains(@class,"font-medium") and contains(@class,"text-neutral-text1")][normalize-space(.)="概览"]'
 OVERVIEW_TIME_BUTTON_XPATH = '//div[contains(@class,"arco-picker-input")]//input[@placeholder="结束日期"]'
 OVERVIEW_YESTERDAY_BUTTON_XPATH = '//div[contains(@class,"arco-typography")][normalize-space(.)="昨天"]'
 OVERVIEW_7_DAYS_BUTTON_XPATH = '//div[contains(@class,"arco-typography")][normalize-space(.)="最近 7 天"]'
 # 概览页面数据加载完成标志。该指标可见才表示概览页或切换后的日期数据已经加载完成。
 # 后续页面结构变化时，只需要在这里替换成任意一个可靠的概览指标 XPath。
 OVERVIEW_DATA_READY_XPATH = '//div[@class="pcm-smc"][contains(.,"GMV")]//div[@class="pcm-smc-content"]'
-
-
-# 从店铺广告页面切换到数据分析概览页面；每一步都由下一个业务元素确认点击成功。
-OVERVIEW_COMMON_CLICK_STEPS: list[dict[str, Any]] = [
-    {
-        "name": "点击数据分析",
-        "xpath": OVERVIEW_ANALYTICS_BUTTON_XPATH,
-        "wait_seconds": 1,
-        "success_xpath": OVERVIEW_PAGE_BUTTON_XPATH,
-        "success_state": "visible",
-        "success_name": "概览按钮已经可见",
-    },
-    {
-        "name": "点击概览",
-        "xpath": OVERVIEW_PAGE_BUTTON_XPATH,
-        "wait_seconds": 2,
-        "success_xpath": OVERVIEW_DATA_READY_XPATH,
-        "success_state": "visible",
-        "success_name": "概览页GMV指标已经可见",
-    },
-]
 
 
 # 数据概览时间范围切换步骤。
@@ -334,32 +295,36 @@ class TiktokAuto:
 
         LOGGER.info("[TikTok][开始] 店铺=%s，准备接管紫鸟浏览器，debugging_port=%s", store_name, debugging_port)
 
-        # 连接紫鸟已经打开的 Chromium，不创建普通浏览器，也不调用 tab.get()。
+        # 连接紫鸟已经打开的 Chromium，不创建普通浏览器；后续固定业务页面仍在这个紫鸟标签页中打开。
         browser = Chromium(f"127.0.0.1:{debugging_port}")
         tab = browser.latest_tab
         collected_at = datetime.now(timezone.utc).isoformat()
         LOGGER.info("[TikTok][浏览器] 店铺=%s，已取得紫鸟当前标签页", store_name)
 
-        # 不等待 document.readyState。登录入口、营销按钮或店铺广告按钮谁先满足条件，就立即进入相应流程。
+        # 登录判断阶段按配置的分阶段轮询规则确认当前店铺是否已经登录。
         login_required = self._is_login_required(tab)
         if login_required:
             self._perform_login(tab)
+        elif not self._wait_for_main_navigation(tab, PAGE_READY_TIMEOUT_SECONDS):
+            # 首次观察没有得到明确状态时，必须等到任一登录确认标志出现后才允许跳转固定页面。
+            raise TimeoutError("TikTok 未发现业务按钮、广告弹窗或验证码弹窗，无法确认登录状态")
 
-        if not self._wait_for_main_navigation(tab, ENTRY_ELEMENT_TIMEOUT_SECONDS):
-            raise TimeoutError("TikTok 未在规定时间内出现营销按钮或店铺广告按钮，无法开始采集")
         self._close_interruptions(tab)
-        LOGGER.info("[TikTok][页面入口] 已发现营销按钮或店铺广告按钮，不等待整页完成，立即开始采集")
 
-        # 1. 点击“营销 -> 店铺广告”，分别采集昨天和 7 天广告数据。
-        LOGGER.info("[TikTok][广告] 开始进入 营销 -> 店铺广告")
+        # 1. 确认登录后直接进入广告页，不再点击“营销 -> 店铺广告”。
+        LOGGER.info("[TikTok][广告] 已确认登录，直接打开广告页=%s", AD_PAGE_URL)
         ad_fields: dict[str, Any] = {}
         ad_raw_values: dict[str, str] = {}
-        ad_yesterday_steps = AD_PERIOD_CLICK_STEPS.get("昨天", [])
-        ad_navigation_ok = self._run_click_steps(tab, AD_COMMON_CLICK_STEPS, self._first_step_xpath(ad_yesterday_steps))
-        # 即使步骤状态验证曾超时，只要广告指标最终可见，仍可确认页面数据已经加载完成。
-        ad_page_ready = ad_navigation_ok or self._element_state_matches(tab, AD_DATA_READY_XPATH, "visible")
+        ad_page_ready = self._open_business_page(
+            tab,
+            AD_PAGE_URL,
+            AD_TIME_BUTTON_XPATH,
+            "TikTok广告页时间面板按钮",
+        )
         if not ad_page_ready:
-            LOGGER.error("[TikTok][广告页面失败] 未确认广告成本指标可见，本店铺两个广告周期均按空值处理")
+            LOGGER.error("[TikTok][广告页面失败] 直接打开广告页后未确认时间面板按钮出现，本店铺两个广告周期均按空值处理")
+        else:
+            LOGGER.info("[TikTok][广告页面就绪] 时间面板按钮已经出现，可以开始切换日期")
 
         for period in ("昨天", "7天"):
             LOGGER.info("[TikTok][广告] 开始切换并采集时间范围=%s", period)
@@ -393,23 +358,20 @@ class TiktokAuto:
             "飞书字段": ad_fields,
         }
 
-        # 2. 点击“数据分析 -> 概览”，分别采集昨天和 7 天概览数据。
-        LOGGER.info("[TikTok][概览] 开始进入 数据分析 -> 概览")
+        # 2. 直接进入数据概览页，不再点击“数据分析 -> 概览”。
+        LOGGER.info("[TikTok][概览] 直接打开数据概览页=%s", OVERVIEW_PAGE_URL)
         overview_fields: dict[str, Any] = {}
         overview_raw_values: dict[str, str] = {}
-        overview_yesterday_steps = OVERVIEW_PERIOD_CLICK_STEPS.get("昨天", [])
-        overview_navigation_ok = self._run_click_steps(
+        overview_page_ready = self._open_business_page(
             tab,
-            OVERVIEW_COMMON_CLICK_STEPS,
-            self._first_step_xpath(overview_yesterday_steps),
-        )
-        overview_page_ready = overview_navigation_ok or self._element_state_matches(
-            tab,
-            OVERVIEW_DATA_READY_XPATH,
-            "visible",
+            OVERVIEW_PAGE_URL,
+            OVERVIEW_TIME_BUTTON_XPATH,
+            "TikTok数据概览页时间面板按钮",
         )
         if not overview_page_ready:
-            LOGGER.error("[TikTok][概览页面失败] 未确认概览GMV指标可见，本店铺两个概览周期均按空值处理")
+            LOGGER.error("[TikTok][概览页面失败] 直接打开数据概览页后未确认时间面板按钮出现，本店铺两个概览周期均按空值处理")
+        else:
+            LOGGER.info("[TikTok][概览页面就绪] 时间面板按钮已经出现，可以开始切换日期")
 
         for period in ("昨天", "7天"):
             LOGGER.info("[TikTok][概览] 开始切换并采集时间范围=%s", period)
@@ -592,6 +554,17 @@ class TiktokAuto:
                 time.monotonic() - started_at,
                 json.dumps(result, ensure_ascii=False),
             )
+            for metric in configured_specs:
+                field_name = metric["field"]
+                raw_text = result.get(field_name, "")
+                LOGGER.info(
+                    "[TikTok][XPath原始数据] 时间范围=%s，字段=%s，XPath=%s，抓取原始数据=%r，原始类型=%s",
+                    period,
+                    field_name,
+                    metric["xpath"],
+                    raw_text,
+                    type(raw_text).__name__,
+                )
             return result
         except Exception as exc:
             LOGGER.exception(
@@ -675,186 +648,43 @@ class TiktokAuto:
                 field_values.pop(amount_field, None)
 
     def _is_login_required(self, tab: Any) -> bool:
-        """首次发现登录入口后分两阶段复查；任一阶段出现业务入口都立即判定已登录。"""
-        started_at = time.monotonic()
-        deadline = started_at + LOGIN_DETECTION_TIMEOUT_SECONDS
+        """先检查登录入口和已登录标志；登录入口出现后等待5秒，再复查一次。"""
+        login_entry = self._find_visible_element(tab, LOGIN_EMAIL_PANEL_BUTTON_XPATH, timeout=0.5)
+        authenticated_marker = self._main_navigation_name(tab)
         LOGGER.info(
-            "[TikTok][入口检测] 同时检查登录入口、营销按钮和店铺广告按钮，最长观察 %.1f 秒",
-            LOGIN_DETECTION_TIMEOUT_SECONDS,
+            "[TikTok][登录初检] 登录入口=%s，已登录标志=%s",
+            "可见" if login_entry else "不可见",
+            authenticated_marker or "未发现",
         )
 
-        while time.monotonic() < deadline:
-            login_entry = self._find_visible_element(tab, LOGIN_EMAIL_PANEL_BUTTON_XPATH, timeout=0.5)
-            navigation_name = self._main_navigation_name(tab)
-
-            # 三个入口可能在页面切换时短暂同时存在，业务入口优先，避免误进登录流程。
-            if navigation_name:
-                LOGGER.info(
-                    "[TikTok][入口检测成功] 已发现%s，确认当前店铺已经登录，不等待 document.readyState",
-                    navigation_name,
-                )
-                return False
-
-            if login_entry:
-                LOGGER.warning(
-                    "[TikTok][登录检测] 首次发现邮箱登录入口；最多等待页面完成 %.1f 秒，"
-                    "期间每 %.1f 秒复查三个入口",
-                    LOGIN_PAGE_READY_TIMEOUT_SECONDS,
-                    LOGIN_RECHECK_INTERVAL_SECONDS,
-                )
-                page_wait_result = self._wait_for_document_or_navigation(
-                    tab,
-                    LOGIN_PAGE_READY_TIMEOUT_SECONDS,
-                    LOGIN_RECHECK_INTERVAL_SECONDS,
-                )
-                if page_wait_result == "navigation":
-                    return False
-                if page_wait_result != "complete":
-                    raise TimeoutError(
-                        f"TikTok 首次发现登录入口后，页面在 {LOGIN_PAGE_READY_TIMEOUT_SECONDS:.0f} 秒内未加载完成"
-                    )
-
-                LOGGER.info(
-                    "[TikTok][登录复查等待] 页面已加载完成；继续观察最长 %.1f 秒，"
-                    "每 %.1f 秒重新检查登录入口、营销按钮和店铺广告按钮",
-                    LOGIN_RECHECK_TIMEOUT_SECONDS,
-                    LOGIN_RECHECK_INTERVAL_SECONDS,
-                )
-                return self._observe_login_entries_after_complete(
-                    tab,
-                    LOGIN_RECHECK_TIMEOUT_SECONDS,
-                    LOGIN_RECHECK_INTERVAL_SECONDS,
-                )
-
-            # 登录判断完成前只移动鼠标，不允许关闭验证码或首页弹窗。
-            self._human_wait(tab, 0.5, check_interruptions=False)
-
-        LOGGER.info(
-            "[TikTok][登录检测] 观察 %.2f 秒仍没有明确入口，暂不执行登录，继续由业务入口等待流程确认",
-            time.monotonic() - started_at,
-        )
-        return False
-
-    def _wait_for_document_or_navigation(
-        self,
-        tab: Any,
-        timeout_seconds: float,
-        check_interval_seconds: float,
-    ) -> str:
-        """等待页面 complete，同时定期复查业务入口；返回 complete、navigation 或 timeout。"""
-        started_at = time.monotonic()
-        deadline = started_at + max(0.0, timeout_seconds)
-        check_count = 0
-        LOGGER.info(
-            "[TikTok][页面加载等待] 最长 %.1f 秒等待 document.readyState=complete，"
-            "每 %.1f 秒复查三个入口，业务入口出现时立即结束等待",
-            timeout_seconds,
-            check_interval_seconds,
-        )
-        while True:
-            check_count += 1
-            login_entry = self._find_visible_element(tab, LOGIN_EMAIL_PANEL_BUTTON_XPATH, timeout=0.5)
-            navigation_name = self._main_navigation_name(tab)
-            try:
-                ready_state = str(tab.run_js("return document.readyState;") or "").strip().lower()
-            except Exception as exc:
-                ready_state = ""
-                LOGGER.warning(
-                    "[TikTok][页面加载检查异常] 第 %s 次读取 document.readyState 失败，异常=%s",
-                    check_count,
-                    exc,
-                )
-
-            LOGGER.info(
-                "[TikTok][页面加载阶段复查] 第 %s 次，登录入口=%s，业务入口=%s，readyState=%r",
-                check_count,
-                "可见" if login_entry else "不可见",
-                navigation_name or "未发现",
-                ready_state or "未知",
-            )
-            if navigation_name:
-                LOGGER.info(
-                    "[TikTok][入口检测成功] 页面尚在加载或刚完成时已发现%s，立即确认当前店铺已经登录",
-                    navigation_name,
-                )
-                return "navigation"
-            if ready_state == "complete":
-                LOGGER.info(
-                    "[TikTok][页面加载完成] 第 %s 次检查确认 document.readyState=complete，耗时 %.2f 秒",
-                    check_count,
-                    time.monotonic() - started_at,
-                )
-                return "complete"
-
-            remaining_seconds = deadline - time.monotonic()
-            if remaining_seconds <= 0:
-                break
-            self._human_wait(
-                tab,
-                min(max(0.1, check_interval_seconds), remaining_seconds),
-                check_interruptions=False,
-            )
-
-        LOGGER.error(
-            "[TikTok][页面加载超时] 等待 %.1f 秒仍未达到 document.readyState=complete",
-            timeout_seconds,
-        )
-        return "timeout"
-
-    def _observe_login_entries_after_complete(
-        self,
-        tab: Any,
-        timeout_seconds: float,
-        check_interval_seconds: float,
-    ) -> bool:
-        """页面完成后定期复查三个入口；业务入口优先，超时后才根据登录入口决定是否登录。"""
-        started_at = time.monotonic()
-        deadline = started_at + max(0.0, timeout_seconds)
-        check_count = 0
-        login_entry_visible = False
-
-        while True:
-            check_count += 1
-            login_entry_visible = bool(
-                self._find_visible_element(tab, LOGIN_EMAIL_PANEL_BUTTON_XPATH, timeout=0.5)
-            )
-            navigation_name = self._main_navigation_name(tab)
-            LOGGER.info(
-                "[TikTok][登录复查] 第 %s 次，耗时 %.2f 秒，登录入口=%s，业务入口=%s",
-                check_count,
-                time.monotonic() - started_at,
-                "可见" if login_entry_visible else "不可见",
-                navigation_name or "未发现",
-            )
-
-            if navigation_name:
-                LOGGER.info(
-                    "[TikTok][入口检测成功] 复查期间发现%s，不再等待，确认当前店铺已经登录",
-                    navigation_name,
-                )
-                return False
-
-            remaining_seconds = deadline - time.monotonic()
-            if remaining_seconds <= 0:
-                break
-            self._human_wait(
-                tab,
-                min(max(0.1, check_interval_seconds), remaining_seconds),
-                check_interruptions=False,
-            )
-
-        if login_entry_visible:
-            LOGGER.warning(
-                "[TikTok][登录检测确认] 页面完成后观察 %.1f 秒仍只发现邮箱登录入口，确认当前店铺未登录",
-                timeout_seconds,
-            )
-            return True
+        # 任何业务按钮、广告弹窗或验证码弹窗都直接表示已登录，优先级高于登录入口。
+        if authenticated_marker:
+            LOGGER.info("[TikTok][登录确认] 初检发现=%s，确认已登录", authenticated_marker)
+            return False
+        if not login_entry:
+            return False
 
         LOGGER.warning(
-            "[TikTok][登录复查结束] 观察 %.1f 秒后三个入口均未发现，暂不执行登录，"
-            "继续由业务入口等待流程确认",
-            timeout_seconds,
+            "[TikTok][登录复查等待] 首次发现登录入口，等待 %.1f 秒后重新检查全部入口",
+            LOGIN_RECHECK_WAIT_SECONDS,
         )
+        self._human_wait(tab, LOGIN_RECHECK_WAIT_SECONDS, check_interruptions=False)
+
+        rechecked_marker = self._main_navigation_name(tab)
+        rechecked_login = self._find_visible_element(tab, LOGIN_EMAIL_PANEL_BUTTON_XPATH, timeout=0.5)
+        LOGGER.info(
+            "[TikTok][登录复查结果] 登录入口=%s，已登录标志=%s",
+            "可见" if rechecked_login else "不可见",
+            rechecked_marker or "未发现",
+        )
+        if rechecked_marker:
+            LOGGER.info("[TikTok][登录确认] 复查发现=%s，确认已登录", rechecked_marker)
+            return False
+        if rechecked_login:
+            LOGGER.warning("[TikTok][登录确认] 复查仍发现登录入口，确认未登录，开始登录流程")
+            return True
+
+        LOGGER.warning("[TikTok][登录状态不明确] 复查时两个类别都未出现，交给后续登录确认等待")
         return False
 
     def _perform_login(self, tab: Any) -> None:
@@ -1339,7 +1169,10 @@ class TiktokAuto:
         """轮询营销/店铺广告按钮；登录阶段可同时接管延迟出现的验证码。"""
         started_at = time.monotonic()
         deadline = started_at + timeout_seconds
-        LOGGER.info("[TikTok][业务入口等待] 最长 %.1f 秒等待营销按钮或店铺广告按钮", timeout_seconds)
+        LOGGER.info(
+            "[TikTok][登录确认等待] 最长 %.1f 秒等待营销按钮、店铺广告按钮、广告弹窗或验证码弹窗",
+            timeout_seconds,
+        )
         while time.monotonic() < deadline:
             navigation_name = self._main_navigation_name(tab)
             if navigation_name:
@@ -1353,15 +1186,53 @@ class TiktokAuto:
                 LOGGER.warning("[TikTok][业务入口等待] 发现延迟出现的登录验证码，立即进入验证码处理")
                 self._solve_login_captcha(tab)
             self._human_wait(tab, 0.5, check_interruptions=False)
-        LOGGER.error("[TikTok][业务入口超时] 未找到营销按钮或店铺广告按钮")
+        LOGGER.error("[TikTok][登录确认超时] 未找到营销按钮、店铺广告按钮、广告弹窗或验证码弹窗")
         return False
 
+    def _open_business_page(self, tab: Any, url: str, ready_xpath: str, page_name: str) -> bool:
+        """在紫鸟当前标签页打开固定业务 URL，并等待该页面的时间控件出现。"""
+        if not url:
+            LOGGER.error("[TikTok][页面跳转失败] 页面=%s，URL 为空", page_name)
+            return False
+        try:
+            LOGGER.info("[TikTok][页面跳转] 页面=%s，开始打开 URL=%s", page_name, url)
+            tab.get(url)
+            LOGGER.info(
+                "[TikTok][页面跳转完成] 页面=%s，已调用 tab.get，等待时间面板按钮出现，xpath=%s",
+                page_name,
+                ready_xpath,
+            )
+        except Exception as exc:
+            LOGGER.exception("[TikTok][页面跳转失败] 页面=%s，URL=%s，异常=%s", page_name, url, exc)
+            return False
+
+        ready = self._wait_for_xpath(
+            tab,
+            ready_xpath,
+            BUSINESS_PAGE_ENTRY_TIMEOUT_SECONDS,
+            f"{page_name}时间面板按钮",
+        )
+        if ready:
+            LOGGER.info("[TikTok][页面就绪] 页面=%s，时间面板按钮已出现，xpath=%s", page_name, ready_xpath)
+        else:
+            LOGGER.error(
+                "[TikTok][页面就绪失败] 页面=%s，等待 %.1f 秒仍未看到时间面板按钮，xpath=%s",
+                page_name,
+                BUSINESS_PAGE_ENTRY_TIMEOUT_SECONDS,
+                ready_xpath,
+            )
+        return ready
+
     def _main_navigation_name(self, tab: Any) -> str:
-        """返回当前可见的业务入口名称；优先识别已经展开的店铺广告按钮。"""
+        """返回当前可见的登录确认标志名称；业务按钮、广告弹窗和验证码弹窗均表示已登录。"""
         if self._find_visible_element(tab, AD_STORE_BUTTON_XPATH, timeout=0.2):
             return "店铺广告按钮"
         if self._find_visible_element(tab, AD_MARKETING_BUTTON_XPATH, timeout=0.2):
             return "营销按钮"
+        if self._find_visible_element(tab, HOME_DIALOG_CLOSE_XPATH, timeout=0.2):
+            return "广告弹窗关闭按钮"
+        if self._find_visible_element(tab, VERIFY_BAR_CLOSE_XPATH, timeout=0.2):
+            return "验证码弹窗关闭按钮"
         return ""
 
     def _prepare_human_click(self, tab: Any, element: Any, step_name: str) -> None:
@@ -1964,7 +1835,13 @@ class TiktokAuto:
                 if element:
                     raw_text = str(element.text or "").strip()
                     if raw_text:
-                        LOGGER.info("[TikTok][指标抓取成功] 字段=%s，原始文本=%r", field_name, raw_text)
+                        LOGGER.info(
+                            "[TikTok][指标抓取成功] 字段=%s，XPath=%s，原始文本=%r，原始类型=%s",
+                            field_name,
+                            xpath,
+                            raw_text,
+                            type(raw_text).__name__,
+                        )
                         return raw_text
                     LOGGER.warning("[TikTok][指标文本为空] 字段=%s，已找到元素但 text 为空", field_name)
                 else:
