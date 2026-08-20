@@ -19,8 +19,8 @@ from .ziniao_client import ZiniaoClient, ZiniaoStoreCloseError, ZiniaoStoreSessi
 LOGGER = logging.getLogger(__name__)
 
 
-# TikTok 多维表和历史电子表的固定字段顺序，与用户建立的 33 个字段完全一致。
-# 电子表按此顺序追加，避免使用字典插入顺序导致不同采集模块的列发生错位。
+# TikTok 多维表的固定字段顺序，与用户建立的33个字段完全一致。
+# 历史电子表使用下面单独定义的 TIKTOK_SPREADSHEET_FIELD_ORDER。
 TIKTOK_TABLE_FIELD_ORDER: tuple[str, ...] = (
     "店铺名",
     "直播GMV",
@@ -68,6 +68,25 @@ TIKTOK_FORMULA_FIELDS: frozenset[str] = frozenset(
         "7天GMV直播比",
         "7天ROI",
     }
+)
+
+# TikTok 历史电子表专用顺序：昨天广告、7天广告、昨天概览、7天概览。
+# 与多维表原有顺序分开维护，避免机器人和电子表受字段插入顺序影响。
+TIKTOK_SPREADSHEET_FIELD_ORDER: tuple[str, ...] = (
+    "店铺名", "昨天成本", "昨天SKU订单数", "昨天均单价", "昨天总收入", "昨天ROI",
+    "7天成本", "7天SKU订单数", "7天均单价", "7天总收入", "7天ROI",
+    "昨天GMV", "昨天成交件数", "昨天订单数", "昨天客户数", "昨天商品访客数", "昨天曝光数", "昨天去重曝光数",
+    "直播GMV", "短视频GMV", "商品卡GMV", "昨天GMV直播比", "昨天GMV视频比", "昨天GMV商品卡比",
+    "7天GMV", "7天成交件数", "7天订单数", "7天客户数", "7天商品访客数", "7天曝光数", "7天去重曝光数", "7天GMV直播比",
+    "采集时间",
+)
+
+# 机器人消息固定使用四个分组；同名 SKU 订单数字段在不同分组中分别读取，不互相覆盖。
+TIKTOK_MESSAGE_GROUPS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ("昨日广告数据", (("成本", "昨天成本"), ("SKU订单数", "昨天SKU订单数"), ("均单价", "昨天均单价"), ("总收入", "昨天总收入"), ("ROI", "昨天ROI"))),
+    ("最近7天广告数据", (("成本", "7天成本"), ("SKU订单数", "7天SKU订单数"), ("均单价", "7天均单价"), ("总收入", "7天总收入"), ("ROI", "7天ROI"))),
+    ("昨日概览数据", (("GMV", "昨天GMV"), ("成交件数", "昨天成交件数"), ("SKU订单数", "昨天SKU订单数"), ("订单数", "昨天订单数"), ("客户数", "昨天客户数"), ("商品访客数", "昨天商品访客数"), ("曝光数", "昨天曝光数"), ("去重曝光数", "昨天去重曝光数"), ("直播GMV", "直播GMV"), ("短视频GMV", "短视频GMV"), ("商品卡GMV", "商品卡GMV"))),
+    ("最近7天概览数据", (("GMV", "7天GMV"), ("成交件数", "7天成交件数"), ("SKU订单数", "7天SKU订单数"), ("订单数", "7天订单数"), ("客户数", "7天客户数"), ("商品访客数", "7天商品访客数"), ("曝光数", "7天曝光数"), ("去重曝光数", "7天去重曝光数"), ("直播GMV", "_7天直播GMV"), ("短视频GMV", "_7天短视频GMV"), ("商品卡GMV", "_7天商品卡GMV"))),
 )
 
 
@@ -316,7 +335,11 @@ class DailyStoreCheck:
                 store_info["采集时间"] = collected_at
                 store_info["数据"] = metric_values
                 self._write_feishu(task, rows)
-                self._safe_notify(task.recipient, f"{task.store_name} {task.platform} 广告数据", self._format_rows(rows))
+                if task.platform == "tiktok":
+                    message_title, message_body = self._format_tiktok_notification(task.store_name, rows)
+                    self._safe_notify_markdown(task.recipient, message_title, message_body)
+                else:
+                    self._safe_notify(task.recipient, f"{task.store_name} {task.platform} 广告数据", self._format_rows(rows))
                 store_info["状态"] = "成功"
         except ZiniaoStoreCloseError as exc:
             LOGGER.exception("店铺 %s 未能关闭，必须中止后续店铺", task.store_name)
@@ -741,7 +764,8 @@ class DailyStoreCheck:
         spreadsheet_values = dict(merged_fields)
         spreadsheet_values["店铺名"] = task.store_name
         spreadsheet_values["采集时间"] = collected_at
-        spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in TIKTOK_TABLE_FIELD_ORDER]
+        spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in TIKTOK_SPREADSHEET_FIELD_ORDER]
+        LOGGER.info("[飞书][TK电子表顺序] 字段顺序=%s，行数据=%s", TIKTOK_SPREADSHEET_FIELD_ORDER, spreadsheet_row)
         return [bitable_record], [spreadsheet_row]
 
     def _build_shopee_feishu_rows(
@@ -895,23 +919,84 @@ class DailyStoreCheck:
                     LOGGER.info("平台 %s 清理旧数据 %s 条", platform, removed)
 
     @staticmethod
+    def _format_tiktok_notification(store_name: str, rows: list[dict[str, Any]]) -> tuple[str, str]:
+        """整理 TK 机器人 Markdown 标题和正文，固定按四个业务分组输出。"""
+        modules: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+        collected_at = ""
+        for row in rows:
+            collected_at = collected_at or str(row.get("采集时间") or "")
+            module_name = "概览" if "概览" in str(row.get("指标") or "") else "广告"
+            fields = row.get("飞书字段", {})
+            fields = dict(fields) if isinstance(fields, dict) else {}
+            raw_values: dict[str, Any] = {}
+            try:
+                parsed_raw = json.loads(str(row.get("原始数据") or "{}"))
+                if isinstance(parsed_raw, dict):
+                    raw_values = parsed_raw
+            except (TypeError, ValueError, json.JSONDecodeError):
+                LOGGER.warning("[飞书][TK消息原始数据解析失败] 模块=%s，原始数据=%r", module_name, row.get("原始数据"))
+            modules[module_name] = (fields, raw_values)
+
+        date_text = ""
+        try:
+            timestamp = datetime.fromisoformat(collected_at.replace("Z", "+00:00"))
+            date_text = f"{timestamp.month}月{timestamp.day}日"
+        except (TypeError, ValueError):
+            date_text = collected_at[:10] if collected_at else "未知日期"
+
+        title = f"{store_name} tiktok 广告数据 - {date_text}"
+        lines: list[str] = []
+        for group_name, metric_specs in TIKTOK_MESSAGE_GROUPS:
+            source_name = "概览" if "概览" in group_name else "广告"
+            fields, raw_values = modules.get(source_name, ({}, {}))
+            lines.append(f"### {group_name}")
+            for label, field_name in metric_specs:
+                value = fields.get(field_name, "")
+                raw_text = str(raw_values.get(field_name) or "")
+                lines.append(f"- **{label}**：{DailyStoreCheck._format_tiktok_display_value(field_name, value, raw_text)}")
+            lines.append("")
+        return title, "\n".join(lines).strip()
+
+    @staticmethod
+    def _format_tiktok_display_value(field_name: str, value: Any, raw_text: str = "") -> str:
+        """把 TK 数值格式化为机器人和人工可读文本，并根据原始值保留 R$/USD 符号。"""
+        if value in (None, ""):
+            return "-"
+        if isinstance(value, str) and "%" in value:
+            return value
+        is_currency = any(token in field_name for token in ("成本", "均单价", "总收入", "GMV"))
+        if is_currency:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return str(value)
+            raw_upper = raw_text.upper()
+            symbol = "R$" if ("R$" in raw_text or "BRL" in raw_upper) else "$" if ("$" in raw_text or "USD" in raw_upper) else ""
+            return f"{symbol}{number:.2f}" if symbol else f"{number:.2f}"
+        if "ROI" in field_name:
+            try:
+                return f"{float(value):.2f}"
+            except (TypeError, ValueError):
+                return str(value)
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float):
+            return f"{value:.2f}"
+        return str(value)
+
+    @staticmethod
     def _format_rows(rows: list[dict[str, Any]]) -> str:
         """生成适合机器人阅读的短文本，避免把大段原始数据直接推送。"""
         if not rows:
             return "本次没有采集到数据。"
         if any(row.get("平台") == "tiktok" for row in rows):
-            merged_fields: dict[str, Any] = {}
-            for row in rows:
-                platform_fields = row.get("飞书字段", {})
-                if isinstance(platform_fields, dict):
-                    for field_name, value in platform_fields.items():
-                        if value not in ("", None):
-                            merged_fields[field_name] = value
-            ordered_fields = [field_name for field_name in TIKTOK_TABLE_FIELD_ORDER if field_name in merged_fields]
-            # 多维表之外的新抓取字段也附在机器人消息末尾，避免调试时看不到数据。
-            extra_fields = sorted(set(merged_fields) - set(TIKTOK_TABLE_FIELD_ORDER))
-            lines = [f"{field_name}: {merged_fields[field_name]}" for field_name in ordered_fields + extra_fields]
-            return "\n".join(lines) if lines else "本次未抓取到有效指标，空值不会写入飞书数值字段。"
+            _, message_body = DailyStoreCheck._format_tiktok_notification(
+                str(rows[0].get("店铺名") or "TikTok"),
+                rows,
+            )
+            return message_body
         if any(row.get("平台") == "mercado" for row in rows):
             merged_fields: dict[str, Any] = {}
             for row in rows:

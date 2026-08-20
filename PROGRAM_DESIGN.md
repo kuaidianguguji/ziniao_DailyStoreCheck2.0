@@ -105,12 +105,12 @@ ziniao_DailyStoreCheck_codex_two/
 - 美客多返回的 `飞书字段` 会被编排器合并到多维表中的同名字段，历史电子表也会追加这些指标值。
 - `TK_auto.py` 确认登录后直接进入 TikTok 固定广告页和数据概览页，各自集中维护 URL、时间面板/日期切换步骤和指标 XPath；未填写或暂时失效的 XPath 按空值处理。
 - TikTok 广告金额字段使用 `currency_code=USD`，概览 GMV 使用 `currency_code=BRL`；两个模块分别返回一条记录，避免同名 SKU 订单数字段相互覆盖。
-- TikTok 首次发现登录入口后最多等待页面 `document.readyState=complete` 60 秒，并每 5 秒复查登录状态；页面完成后最多再观察 60 秒，同样每 5 秒复查。任一阶段出现营销按钮、店铺广告按钮、首页广告弹窗关闭按钮或 `verify-bar-close` 验证码弹窗关闭按钮，都会立即确认已经登录。确认登录后关闭可见干扰，并直接打开 `https://seller-br.tiktok.com/ads-creation/dashboard` 和 `https://seller-br.tiktok.com/compass/data-overview`，分别等待时间面板按钮出现；每次切换昨天/7天后也必须重新确认对应指标可见。
+- TikTok 接管后立即同时检查登录入口、营销按钮、店铺广告按钮、首页广告弹窗关闭按钮和 `verify-bar-close` 验证码弹窗关闭按钮，不等待 `document.readyState`。首次只看到登录入口时固定等待 `LOGIN_RECHECK_WAIT_SECONDS` 后复查，复查仍只有登录入口才执行登录；登录流程每一步前后都会检查四类已登录标志，发现任一标志便立即结束登录流程。确认登录后直接打开广告页和数据概览页，时间按钮及日期选项的出现/消失统一在 `TK_STEP_WAIT_SECONDS` 内确认，随后等待页面完成和数据标志再批量抓取。
 - TikTok 登录默认直接提交；仅在出现“请检查输入的手机号格式”时切换邮箱并重新登录。登录提交后如果出现物体匹配验证码，程序从内存读取图片，调用通义千问视觉模型识别两个相同物体，通过当前紫鸟标签页的 CDP 鼠标事件点击坐标并提交；API Key 配置在 `platforms.tiktok.captcha.qwen_api_key`，也可使用环境变量 `DASHSCOPE_API_KEY`。
 - TikTok 同一日期周期的全部指标通过一次页面 JavaScript 批量 XPath 读取；批量脚本异常时才回退为逐项读取。日志会逐项打印字段名、完整 XPath、该 XPath 抓到的原始文本和类型，再打印转换结果。
-- TikTok 普通按钮采用“首次 + 3 次重试”，相邻尝试至少间隔 2 秒；成功点击后根据下一步 XPath 最多等待 30 秒。
+- TikTok 日期按钮采用“首次 + 3 次重试”，相邻尝试至少间隔 2 秒；时间面板出现和日期选项消失都以统一的 `TK_STEP_WAIT_SECONDS`（默认5秒）作为单次状态确认超时。
 - TikTok 会详细记录页面状态、按钮 XPath、每次点击和重试结果、下一元素等待、弹窗处理，以及每个指标的原始值、转换值和 Python 类型；日志同时显示在控制台并写入 `data/daily_store_check.log`。
-- TikTok 写入飞书时会把广告和概览合并成一条 33 字段记录；公式字段不发送、空数值不发送、日期转换为毫秒时间戳，历史电子表固定使用 33 列顺序。多维表、电子表和机器人最终出站 JSON 以及飞书失败响应都会写入日志，token、密钥和签名自动脱敏。
+- TikTok 写入多维表时仍使用原有33字段定义；公式字段不发送、空数值不发送、日期转换为毫秒时间戳。机器人改用 Markdown 卡片，按“昨天广告、7天广告、昨天概览、7天概览”分组并依据 XPath 原始文本补充 `$` 或 `R$`。历史电子表仍为33列，但使用 `TIKTOK_SPREADSHEET_FIELD_ORDER` 按相同业务分组重新排列。
 - `MKD_auto.py` 接管紫鸟当前标签页并等待初始页面加载完成，按当前网址选择经营指标页后再次等待页面加载，再额外等待 10 秒处理首页广告。所有按钮采用首次点击加 3 次重试，重试间隔至少 2 秒，点击后最多等待 30 秒让下一按钮或数据出现。
 - `SP_auto.py` 接管首页后立即检查广告弹窗，页面加载完成后再检查一次；随后判断“Shopee广告”是否可见，不可见时点击“营销中心”并以“Shopee广告”出现作为展开成功条件。
 - Shopee 刚接管紫鸟标签页时会优先检查同时包含 `password` 和 `loginKey` 输入框的登录表单，页面加载后、任何菜单操作前再复查一次；发现该表单便停止当前店铺采集，由紫鸟会话关闭店铺并在关闭确认成功后继续下一店铺。未发现该表单时，仍按 `LOGIN_BUTTON_XPATHS` 的顺序处理其他登录按钮。
@@ -176,7 +176,7 @@ feishu:
 5. 当前 `robot.receive_id_type` 为 `open_id`；最终汇总接收人在 `robot.summary_recipients` 中按 `姓名: ou_xxx` 填写。字典为空时不发送 DeepSeek 分析结果。
 6. TikTok、Shopee、美客多短期表分别严格使用项目定义的 33、26、32 个字段；不要再为 Shopee 创建通用的“指标/数值/原始数据”字段。
 7. 多维表“采集时间”使用日期字段，程序写入前统一转换为毫秒时间戳。
-8. 三张历史电子表第一行应分别按 `TIKTOK_TABLE_FIELD_ORDER`、`SHOPEE_TABLE_FIELD_ORDER`、`MERCADO_TABLE_FIELD_ORDER` 建立 33、26、32 列。
+8. 三张历史电子表第一行应分别按 `TIKTOK_SPREADSHEET_FIELD_ORDER`、`SHOPEE_TABLE_FIELD_ORDER`、`MERCADO_TABLE_FIELD_ORDER` 建立33、26、32列；TK表头需要同步调整为新的分组顺序。
 
 ## 6. 启动方式
 

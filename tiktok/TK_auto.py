@@ -81,8 +81,6 @@ DATA_PAGE_READY_TIMEOUT_SECONDS = 60
 CLICK_RETRY_TIMES = 3
 # 同一按钮相邻两次重试之间的基础等待秒数；实际还会随机增加 0 至 1 秒。
 CLICK_RETRY_INTERVAL_SECONDS = 2
-# 通用旧按钮流程的最长等待时间；固定页面的新日期流程使用 TK_STEP_WAIT_SECONDS。
-NEXT_ELEMENT_TIMEOUT_SECONDS = 30
 # 数据加载完成标志首次未出现后允许的重查次数；值为 5 表示最多额外检查 5 次。
 DATA_READY_RETRY_TIMES = 5
 # 数据加载完成标志相邻两次检查的等待秒数；5 次重查最长等待约 10 秒。
@@ -127,7 +125,6 @@ AD_PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
         {
             "name": "广告-点击时间按钮",
             "xpath": AD_TIME_BUTTON_XPATH,
-            "wait_seconds": 1,
             "success_xpath": AD_YESTERDAY_BUTTON_XPATH,
             "success_state": "visible",
             "success_name": "昨天按钮已经出现",
@@ -135,7 +132,6 @@ AD_PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
         {
             "name": "广告-点击昨天按钮",
             "xpath": AD_YESTERDAY_BUTTON_XPATH,
-            "wait_seconds": 2,
             "success_xpath": AD_YESTERDAY_BUTTON_XPATH,
             "success_state": "hidden",
             "success_name": "昨天按钮已经消失",
@@ -145,7 +141,6 @@ AD_PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
         {
             "name": "广告-再次点击时间按钮",
             "xpath": AD_TIME_BUTTON_XPATH,
-            "wait_seconds": 1,
             "success_xpath": AD_7_DAYS_BUTTON_XPATH,
             "success_state": "visible",
             "success_name": "最近7天按钮已经出现",
@@ -153,7 +148,6 @@ AD_PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
         {
             "name": "广告-点击7天按钮",
             "xpath": AD_7_DAYS_BUTTON_XPATH,
-            "wait_seconds": 2,
             "success_xpath": AD_7_DAYS_BUTTON_XPATH,
             "success_state": "hidden",
             "success_name": "最近7天按钮已经消失",
@@ -196,7 +190,6 @@ OVERVIEW_PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
         {
             "name": "概览-点击时间按钮",
             "xpath": OVERVIEW_TIME_BUTTON_XPATH,
-            "wait_seconds": 1,
             "success_xpath": OVERVIEW_YESTERDAY_BUTTON_XPATH,
             "success_state": "visible",
             "success_name": "概览昨天按钮已经出现",
@@ -204,7 +197,6 @@ OVERVIEW_PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
         {
             "name": "概览-点击昨天按钮",
             "xpath": OVERVIEW_YESTERDAY_BUTTON_XPATH,
-            "wait_seconds": 2,
             "success_xpath": OVERVIEW_YESTERDAY_BUTTON_XPATH,
             "success_state": "hidden",
             "success_name": "概览昨天按钮已经消失",
@@ -214,7 +206,6 @@ OVERVIEW_PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
         {
             "name": "概览-再次点击时间按钮",
             "xpath": OVERVIEW_TIME_BUTTON_XPATH,
-            "wait_seconds": 1,
             "success_xpath": OVERVIEW_7_DAYS_BUTTON_XPATH,
             "success_state": "visible",
             "success_name": "概览最近7天按钮已经出现",
@@ -222,7 +213,6 @@ OVERVIEW_PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
         {
             "name": "概览-点击7天按钮",
             "xpath": OVERVIEW_7_DAYS_BUTTON_XPATH,
-            "wait_seconds": 2,
             "success_xpath": OVERVIEW_7_DAYS_BUTTON_XPATH,
             "success_state": "hidden",
             "success_name": "概览最近7天按钮已经消失",
@@ -261,17 +251,17 @@ OVERVIEW_METRIC_SPECS: list[dict[str, str]] = [
 
 
 # 每个占比都由“同周期渠道 GMV / 同周期总 GMV * 100”计算，结果保留两位小数。
-# remove_amount=True 表示该渠道金额只是内部计算变量，不对应当前飞书多维表字段。
+# 7天渠道金额会保留给机器人消息使用，多维表打包时自动忽略这些内部字段。
 OVERVIEW_GMV_RATIO_SPECS: dict[str, list[dict[str, Any]]] = {
     "昨天": [
-        {"amount_field": "直播GMV", "ratio_field": "昨天GMV直播比", "remove_amount": False},
-        {"amount_field": "短视频GMV", "ratio_field": "昨天GMV视频比", "remove_amount": False},
-        {"amount_field": "商品卡GMV", "ratio_field": "昨天GMV商品卡比", "remove_amount": False},
+        {"amount_field": "直播GMV", "ratio_field": "昨天GMV直播比"},
+        {"amount_field": "短视频GMV", "ratio_field": "昨天GMV视频比"},
+        {"amount_field": "商品卡GMV", "ratio_field": "昨天GMV商品卡比"},
     ],
     "7天": [
-        {"amount_field": "_7天直播GMV", "ratio_field": "7天GMV直播比", "remove_amount": True},
-        {"amount_field": "_7天短视频GMV", "ratio_field": "7天GMV视频比", "remove_amount": True},
-        {"amount_field": "_7天商品卡GMV", "ratio_field": "7天GMV商品卡比", "remove_amount": True},
+        {"amount_field": "_7天直播GMV", "ratio_field": "7天GMV直播比"},
+        {"amount_field": "_7天短视频GMV", "ratio_field": "7天GMV视频比"},
+        {"amount_field": "_7天商品卡GMV", "ratio_field": "7天GMV商品卡比"},
     ],
 }
 
@@ -338,6 +328,7 @@ class TiktokAuto:
                 self._record_empty_period_metrics(period, AD_METRIC_SPECS, ad_fields, ad_raw_values, "日期按钮点击或状态验证失败")
                 continue
 
+            self._wait_for_document_complete_after_period(tab, f"广告-{period}")
             data_loaded = self._wait_for_data_ready_marker(
                 tab,
                 AD_DATA_READY_XPATH,
@@ -397,6 +388,7 @@ class TiktokAuto:
                 )
                 continue
 
+            self._wait_for_document_complete_after_period(tab, f"概览-{period}")
             data_loaded = self._wait_for_data_ready_marker(
                 tab,
                 OVERVIEW_DATA_READY_XPATH,
@@ -437,6 +429,33 @@ class TiktokAuto:
             len(overview_fields),
         )
         return [ad_row, overview_row]
+
+    def _wait_for_document_complete_after_period(self, tab: Any, step_name: str) -> bool:
+        """日期切换后等待页面完成；超时会记录日志，数据标志仍作为最终抓取门槛。"""
+        deadline = time.monotonic() + DATA_PAGE_READY_TIMEOUT_SECONDS
+        check_count = 0
+        LOGGER.info(
+            "[TikTok][日期页面加载等待] 步骤=%s，最长 %.1f 秒等待 document.readyState=complete",
+            step_name,
+            DATA_PAGE_READY_TIMEOUT_SECONDS,
+        )
+        while time.monotonic() < deadline:
+            check_count += 1
+            try:
+                ready_state = str(tab.run_js("return document.readyState;") or "").strip().lower()
+            except Exception as exc:
+                ready_state = ""
+                LOGGER.warning("[TikTok][日期页面加载异常] 步骤=%s，第%s次检查异常=%s", step_name, check_count, exc)
+            if ready_state == "complete":
+                LOGGER.info("[TikTok][日期页面加载完成] 步骤=%s，第%s次检查成功", step_name, check_count)
+                return True
+            self._human_wait(tab, 0.5, check_interruptions=True)
+        LOGGER.warning(
+            "[TikTok][日期页面加载超时] 步骤=%s，%.1f 秒内未达到 complete，继续等待数据标志",
+            step_name,
+            DATA_PAGE_READY_TIMEOUT_SECONDS,
+        )
+        return False
 
     def _collect_period_metrics(
         self,
@@ -643,9 +662,7 @@ class TiktokAuto:
                     total_value,
                 )
 
-            # 当前飞书表没有 7 天渠道 GMV 金额字段，只保留算出的占比，避免提交不存在的临时字段。
-            if bool(ratio_spec.get("remove_amount")):
-                field_values.pop(amount_field, None)
+            # 7天渠道金额保留在内部结果，供机器人消息和调试日志显示；多维表打包时仍过滤未知临时字段。
 
     def _is_login_required(self, tab: Any) -> bool:
         """先检查登录入口和已登录标志；登录入口出现后等待5秒，再复查一次。"""
@@ -688,37 +705,72 @@ class TiktokAuto:
         return False
 
     def _perform_login(self, tab: Any) -> None:
-        """只有出现手机号格式错误时才切换邮箱；最终以业务菜单出现确认登录成功。"""
+        """执行原有登录逻辑；每一步前后发现已登录标志时立即结束登录流程。"""
         LOGGER.warning("[TikTok][登录流程] 开始处理 TikTok 登录，登录完成前暂停其他弹窗检测")
+        if self._login_step_already_authenticated(tab, "登录流程开始前"):
+            return
 
         switched_to_email = self._element_state_matches(tab, LOGIN_PHONE_FORMAT_ERROR_XPATH, "visible")
         if switched_to_email:
             LOGGER.warning("[TikTok][登录判断] 已发现“请检查输入的手机号格式”，先切换邮箱再登录")
             self._switch_to_email_login(tab)
+            if self._login_step_already_authenticated(tab, "切换邮箱后"):
+                return
         else:
             LOGGER.info("[TikTok][登录判断] 当前没有手机号格式错误提示，不切换邮箱，直接点击登录")
 
+        if self._login_step_already_authenticated(tab, "点击登录按钮前"):
+            return
         self._click_login_button(tab, "登录-点击登录按钮")
+        if self._login_step_already_authenticated(tab, "点击登录按钮后"):
+            return
 
         # 每次提交后同时等待业务菜单、手机号格式错误和图形验证码，避免只等待菜单导致验证码超时。
         login_outcome = self._wait_for_login_outcome(tab, LOGIN_SUBMIT_RESULT_TIMEOUT_SECONDS)
+        if login_outcome == "authenticated":
+            return
         if login_outcome == "phone_error":
             if switched_to_email:
                 raise RuntimeError("TikTok 已切换邮箱登录，但仍显示手机号格式错误")
             LOGGER.warning("[TikTok][登录判断] 直接登录后出现手机号格式错误，开始切换邮箱并重新登录")
+            if self._login_step_already_authenticated(tab, "重新切换邮箱前"):
+                return
             self._switch_to_email_login(tab)
             switched_to_email = True
+            if self._login_step_already_authenticated(tab, "重新切换邮箱后"):
+                return
             self._click_login_button(tab, "登录-邮箱模式重新点击登录按钮")
+            if self._login_step_already_authenticated(tab, "邮箱模式重新登录后"):
+                return
             login_outcome = self._wait_for_login_outcome(tab, LOGIN_SUBMIT_RESULT_TIMEOUT_SECONDS)
 
         if login_outcome == "captcha":
             self._solve_login_captcha(tab)
         elif login_outcome == "phone_error":
             raise RuntimeError("TikTok 邮箱模式登录后仍显示手机号格式错误")
+        elif login_outcome == "authenticated":
+            return
 
-        if not self._wait_for_main_navigation(tab, ENTRY_ELEMENT_TIMEOUT_SECONDS, handle_login_captcha=True):
-            raise TimeoutError("TikTok 登录后未出现营销按钮或店铺广告按钮")
-        LOGGER.info("[TikTok][登录成功] 已发现营销按钮或店铺广告按钮，不等待整页加载完成")
+        if not self._wait_for_main_navigation(tab, PAGE_READY_TIMEOUT_SECONDS, handle_login_captcha=True):
+            raise TimeoutError("TikTok 登录后未出现业务按钮、广告弹窗或验证码弹窗")
+        LOGGER.info("[TikTok][登录成功] 已发现登录确认标志，立即进入已登录后的固定页面流程")
+
+    def _login_step_already_authenticated(self, tab: Any, step_name: str) -> bool:
+        """登录过程每一步调用；发现四类已登录标志之一时立刻切换到已登录流程。"""
+        marker_name = self._main_navigation_name(tab)
+        LOGGER.info(
+            "[TikTok][登录步骤复查] 步骤=%s，已登录标志=%s",
+            step_name,
+            marker_name or "未发现",
+        )
+        if not marker_name:
+            return False
+        LOGGER.info(
+            "[TikTok][登录中途确认成功] 步骤=%s，发现=%s，停止剩余登录步骤",
+            step_name,
+            marker_name,
+        )
+        return True
 
     def _switch_to_email_login(self, tab: Any) -> None:
         """点击邮箱切换按钮，并用 selected 标志确认切换完成。"""
@@ -730,6 +782,7 @@ class TiktokAuto:
             success_state="visible",
             success_name="邮箱登录入口已经切换为 selected 状态",
             check_interruptions=False,
+            stop_when_authenticated=True,
         )
         if not email_mode_ready:
             raise RuntimeError("TikTok 已出现手机号格式错误，但无法切换到邮箱登录状态")
@@ -741,6 +794,7 @@ class TiktokAuto:
             LOGIN_BUTTON_XPATH,
             step_name,
             check_interruptions=False,
+            stop_when_authenticated=True,
         ):
             raise RuntimeError("TikTok 登录按钮点击失败")
 
@@ -750,16 +804,16 @@ class TiktokAuto:
         deadline = started_at + timeout_seconds
         LOGGER.info("[TikTok][登录结果等待] 最长 %.1f 秒等待业务菜单、手机号格式错误或图形验证码", timeout_seconds)
         while time.monotonic() < deadline:
+            navigation_name = self._main_navigation_name(tab)
+            if navigation_name:
+                LOGGER.info("[TikTok][登录结果] 已发现%s，直接登录成功", navigation_name)
+                return "authenticated"
             if self._element_state_matches(tab, LOGIN_PHONE_FORMAT_ERROR_XPATH, "visible"):
                 LOGGER.warning("[TikTok][登录结果] 已出现“请检查输入的手机号格式”")
                 return "phone_error"
             if self._element_state_matches(tab, CAPTCHA_IMAGE_XPATH, "visible"):
                 LOGGER.warning("[TikTok][登录结果] 已发现物体匹配验证码")
                 return "captcha"
-            navigation_name = self._main_navigation_name(tab)
-            if navigation_name:
-                LOGGER.info("[TikTok][登录结果] 已发现%s，直接登录成功", navigation_name)
-                return "navigation"
             self._human_wait(tab, 0.5, check_interruptions=False)
         LOGGER.info("[TikTok][登录结果等待] %.1f 秒内没有明确结果，继续等待业务菜单", time.monotonic() - started_at)
         return "pending"
@@ -790,6 +844,8 @@ class TiktokAuto:
         )
 
         for attempt in range(max_attempts):
+            if self._login_step_already_authenticated(tab, f"验证码处理第{attempt + 1}轮开始前"):
+                return
             captcha_img = self._find_visible_element(tab, CAPTCHA_IMAGE_XPATH, timeout=3)
             if not captcha_img:
                 LOGGER.info("[TikTok][验证码处理] 第 %s/%s 次处理前验证码已经消失", attempt + 1, max_attempts)
@@ -1128,7 +1184,7 @@ class TiktokAuto:
 
     def _click_captcha_confirm(self, tab: Any) -> None:
         """点击验证码确认按钮；确认按钮不存在时立即报错，避免错误坐标被当作已提交。"""
-        confirm_button = self._find_visible_element(tab, CAPTCHA_CONFIRM_BUTTON_XPATH, timeout=5)
+        confirm_button = self._find_visible_element(tab, CAPTCHA_CONFIRM_BUTTON_XPATH, timeout=TK_STEP_WAIT_SECONDS)
         if not confirm_button:
             raise RuntimeError("TikTok 验证码确认按钮不可见")
         self._prepare_human_click(tab, confirm_button, "验证码-点击确认按钮")
@@ -1313,50 +1369,6 @@ class TiktokAuto:
         """记录真实点击完成时间，供下一个按钮计算最小随机间隔。"""
         self._last_button_click_at = time.monotonic()
 
-    def _run_click_steps(self, tab: Any, steps: list[dict[str, Any]], final_next_xpath: str = "") -> bool:
-        """按顺序点击按钮；点击后的目标状态也必须满足，才把该步骤判定为成功。"""
-        all_steps_succeeded = True
-        for index, step in enumerate(steps):
-            step_name = str(step.get("name") or f"第 {index + 1} 个未命名按钮")
-            xpath = str(step.get("xpath") or "").strip()
-            if not xpath:
-                LOGGER.warning("[TikTok][按钮跳过] 步骤=%s，原因=XPath 为空", step_name)
-                all_steps_succeeded = False
-                continue
-
-            LOGGER.info("[TikTok][按钮] 准备点击：步骤=%s，xpath=%s", step_name, xpath)
-            clicked = self._click_with_retry(
-                tab,
-                xpath,
-                step_name,
-                success_xpath=str(step.get("success_xpath") or "").strip(),
-                success_state=str(step.get("success_state") or "").strip().lower(),
-                success_name=str(step.get("success_name") or "点击后的页面状态"),
-            )
-            if not clicked:
-                all_steps_succeeded = False
-                LOGGER.error("[TikTok][按钮失败] 步骤=%s，首次及 3 次重试的点击或状态验证均未成功", step_name)
-                continue
-
-            wait_seconds = float(step.get("wait_seconds", 1) or 0)
-            if wait_seconds > 0:
-                LOGGER.info("[TikTok][按钮] 步骤=%s 点击成功，先等待 %.1f 秒", step_name, wait_seconds)
-                self._human_wait(tab, wait_seconds, check_interruptions=True)
-
-            next_xpath = self._next_step_xpath(steps, index + 1)
-            next_name = "后续按钮"
-            if not next_xpath:
-                next_xpath = final_next_xpath
-                next_name = "当前模块的首个数据指标"
-            if next_xpath and not self._wait_for_xpath(
-                tab,
-                next_xpath,
-                NEXT_ELEMENT_TIMEOUT_SECONDS,
-                f"{step_name} 后的{next_name}",
-            ):
-                all_steps_succeeded = False
-        return all_steps_succeeded
-
     def _run_period_click_steps(self, tab: Any, steps: list[dict[str, Any]]) -> bool:
         """执行“打开日期面板 -> 选择日期”；日期选项消失时自动重新打开面板。"""
         if len(steps) < 2:
@@ -1385,12 +1397,9 @@ class TiktokAuto:
             success_xpath=option_xpath,
             success_state="visible",
             success_name=str(open_step.get("success_name") or "日期选项已经出现"),
+            success_timeout_seconds=TK_STEP_WAIT_SECONDS,
         )
-        if panel_opened:
-            wait_seconds = float(open_step.get("wait_seconds", 1) or 0)
-            if wait_seconds > 0:
-                self._human_wait(tab, wait_seconds, check_interruptions=True)
-        else:
+        if not panel_opened:
             # 不在这里终止：下一步会再次检查日期选项；不可见时由 recovery_xpath 重做本步骤。
             LOGGER.warning("[TikTok][日期流程恢复] 上一步=%s 未确认成功，下一步将按页面实际可见性决定是否重开面板", open_name)
 
@@ -1404,15 +1413,17 @@ class TiktokAuto:
             recovery_xpath=open_xpath,
             recovery_step_name=f"{open_name}（日期选项不可见，重新执行上一步）",
             recovery_success_name=str(open_step.get("success_name") or "日期选项已经重新出现"),
+            success_timeout_seconds=TK_STEP_WAIT_SECONDS,
         )
         if not option_clicked:
             LOGGER.error("[TikTok][日期流程失败] 日期选项=%s 点击及恢复均失败", option_name)
             return False
 
-        wait_seconds = float(option_step.get("wait_seconds", 2) or 0)
-        if wait_seconds > 0:
-            LOGGER.info("[TikTok][日期流程] 日期选项=%s 点击成功，等待 %.1f 秒", option_name, wait_seconds)
-            self._human_wait(tab, wait_seconds, check_interruptions=True)
+        LOGGER.info(
+            "[TikTok][日期流程成功] 日期选项=%s 点击后已在 %.1f 秒内消失，确认日期切换成功",
+            option_name,
+            TK_STEP_WAIT_SECONDS,
+        )
         return True
 
     def _click_with_retry(
@@ -1427,11 +1438,15 @@ class TiktokAuto:
         recovery_xpath: str = "",
         recovery_step_name: str = "重新执行上一步",
         recovery_success_name: str = "目标按钮已经重新出现",
+        success_timeout_seconds: float = TK_STEP_WAIT_SECONDS,
+        stop_when_authenticated: bool = False,
     ) -> bool:
-        """按钮最多点击 4 次；目标不可见且配置 recovery_xpath 时，先重新执行上一步。"""
+        """按钮最多点击4次，并在统一超时内验证状态；登录步骤可被已登录标志提前终止。"""
         max_attempts = CLICK_RETRY_TIMES + 1
         click_dispatched = False
         for attempt in range(max_attempts):
+            if stop_when_authenticated and self._login_step_already_authenticated(tab, f"{step_name} 第{attempt + 1}次点击前"):
+                return True
             # 对“展开菜单、打开面板”类步骤，目标元素已经可见就说明当前状态正确，不应再次点击把它关闭。
             if success_xpath and success_state == "visible" and self._element_state_matches(tab, success_xpath, "visible"):
                 LOGGER.info("[TikTok][按钮验证成功] 步骤=%s，%s，无需再次点击", step_name, success_name)
@@ -1464,7 +1479,7 @@ class TiktokAuto:
                     max_attempts,
                     xpath,
                 )
-                element = self._find_visible_element(tab, xpath, timeout=5)
+                element = self._find_visible_element(tab, xpath, timeout=TK_STEP_WAIT_SECONDS)
                 if not element and recovery_xpath:
                     LOGGER.warning(
                         "[TikTok][按钮恢复上一步] 步骤=%s，第 %s/%s 次尝试发现目标不可见；不直接重试目标，先执行=%s，xpath=%s",
@@ -1482,9 +1497,10 @@ class TiktokAuto:
                         success_state="visible",
                         success_name=recovery_success_name,
                         check_interruptions=check_interruptions,
+                        success_timeout_seconds=success_timeout_seconds,
                     )
                     if recovered:
-                        element = self._find_visible_element(tab, xpath, timeout=5)
+                        element = self._find_visible_element(tab, xpath, timeout=TK_STEP_WAIT_SECONDS)
                         LOGGER.info(
                             "[TikTok][按钮恢复结果] 步骤=%s，重新执行上一步后目标可见=%s",
                             step_name,
@@ -1502,6 +1518,8 @@ class TiktokAuto:
                 element.click()
                 click_dispatched = True
                 self._record_button_click()
+                if stop_when_authenticated and self._login_step_already_authenticated(tab, f"{step_name} 第{attempt + 1}次点击后"):
+                    return True
                 if check_interruptions:
                     self._close_interruptions(tab)
 
@@ -1511,7 +1529,7 @@ class TiktokAuto:
                         tab,
                         success_xpath,
                         success_state,
-                        NEXT_ELEMENT_TIMEOUT_SECONDS,
+                        success_timeout_seconds,
                         success_name,
                         check_interruptions=check_interruptions,
                     )
@@ -1798,20 +1816,6 @@ class TiktokAuto:
                         time.sleep(CLICK_RETRY_INTERVAL_SECONDS + random.uniform(0, 1))
             if detected and not closed:
                 LOGGER.error("[TikTok][干扰未关闭] %s连续 %s 次关闭失败，程序继续执行", interruption_name, CLICK_RETRY_TIMES + 1)
-
-    @staticmethod
-    def _next_step_xpath(steps: list[dict[str, Any]], start_index: int) -> str:
-        """从后续步骤中找到第一个非空 XPath。"""
-        for step in steps[start_index:]:
-            xpath = str(step.get("xpath") or "").strip()
-            if xpath:
-                return xpath
-        return ""
-
-    @staticmethod
-    def _first_step_xpath(steps: list[dict[str, Any]]) -> str:
-        """返回一组点击步骤中的第一个非空 XPath。"""
-        return TiktokAuto._next_step_xpath(steps, 0)
 
     def _read_xpath(self, tab: Any, xpath: str, field_name: str = "未命名指标") -> str:
         """读取一个 XPath 文本；XPath 为空、元素不存在或异常时返回空字符串。"""
