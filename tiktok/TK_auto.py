@@ -20,6 +20,7 @@ import time
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 from DrissionPage import Chromium
@@ -38,6 +39,11 @@ LOGIN_EMAIL_SELECTED_XPATH = (
 LOGIN_BUTTON_XPATH = '//button[@id="TikTok_Ads_SSO_Login_Btn"]'
 # 只有出现“手机号格式错误”提示时才切换到邮箱登录；没有该提示时直接点击登录。
 LOGIN_PHONE_FORMAT_ERROR_XPATH = '//span[contains(@class,"error-msg") and normalize-space(.)="请检查输入的手机号格式"]'
+
+# TikTok 路由级登录状态。登录页可能附带 shop_region 等查询参数，
+# 因此后续使用 URL 的 path 判断，不使用完整字符串相等。
+TIKTOK_LOGIN_URL = "https://seller-br.tiktok.com/account/login"
+TIKTOK_HOME_URL_PREFIX = "https://seller-br.tiktok.com/homepage"
 
 # 登录提交后可能出现的“两个相同 3D 物体”验证码。
 CAPTCHA_IMAGE_XPATH = '//img[@alt="captchaOpti_hCaptchaModal1_header"]'
@@ -70,6 +76,12 @@ VERIFY_BAR_CLOSE_XPATH = '//a[@id="verify-bar-close"]'
 # 页面和按钮操作参数。
 # 首次发现登录入口后，等待多少秒再重新检查登录入口和四类已登录标志；后续可直接调整。
 LOGIN_RECHECK_WAIT_SECONDS = 5
+
+# 当当前路由是登录页时，连续检查多少次 URL；4 次、每次间隔 5 秒，总观察窗口约 20 秒。
+LOGIN_URL_CHECK_TIMES = 4
+# 登录页 URL 连续检查之间的等待时间；首页 URL 在中途出现时立即结束检查，不会等待完全部次数。
+LOGIN_URL_CHECK_INTERVAL_SECONDS = 5
+
 # 页面跳转后、数据标志出现前的最长等待时间。
 PAGE_READY_TIMEOUT_SECONDS = 60
 # 每次点击时间按钮或日期按钮后，最多等待多少秒确认状态；超时才进入重试。
@@ -274,6 +286,8 @@ class TiktokAuto:
         self.config = config or {}
         # 记录最近一次真实点击的时间；后续每次点击都会据此补足随机的人类操作间隔。
         self._last_button_click_at: float | None = None
+        # 保存本轮 URL 登录判定结果，避免 collect() 在已经确认 homepage 时再次等待元素标志。
+        self._last_url_login_state: str | None = None
 
     def collect(self, store_name: str, download_path: str = "", debugging_port: int | str | None = None) -> list[dict[str, Any]]:
         """接管紫鸟当前标签页，依次采集广告数据和数据分析概览。"""
@@ -282,6 +296,7 @@ class TiktokAuto:
 
         # 每间店铺重新计算点击节奏，避免上一间店铺的关闭时间影响当前店铺。
         self._last_button_click_at = None
+        self._last_url_login_state = None
 
         LOGGER.info("[TikTok][开始] 店铺=%s，准备接管紫鸟浏览器，debugging_port=%s", store_name, debugging_port)
 
@@ -295,6 +310,12 @@ class TiktokAuto:
         login_required = self._is_login_required(tab)
         if login_required:
             self._perform_login(tab)
+            # 登录流程中的验证码或弹窗可能让按钮提前出现；最终必须等 URL 真正离开登录页，
+            # 进入 homepage（允许查询参数）后，才允许跳转广告页。
+            if not self._wait_for_homepage_url(tab, PAGE_READY_TIMEOUT_SECONDS):
+                raise TimeoutError("TikTok 登录流程结束后 URL 仍未进入 homepage，不能确认登录完成")
+        elif self._last_url_login_state == "home":
+            LOGGER.info("[TikTok][登录确认] URL 已确认是 homepage，跳过业务按钮二次等待")
         elif not self._wait_for_main_navigation(tab, PAGE_READY_TIMEOUT_SECONDS):
             # 首次观察没有得到明确状态时，必须等到任一登录确认标志出现后才允许跳转固定页面。
             raise TimeoutError("TikTok 未发现业务按钮、广告弹窗或验证码弹窗，无法确认登录状态")
@@ -664,8 +685,157 @@ class TiktokAuto:
 
             # 7天渠道金额保留在内部结果，供机器人消息和调试日志显示；多维表打包时仍过滤未知临时字段。
 
+    @staticmethod
+    def _current_url(tab: Any) -> str:
+        """读取当前标签页 URL；优先使用 DrissionPage 属性，失败时使用页面脚本兜底。"""
+        try:
+            value = getattr(tab, "url", "")
+            if callable(value):
+                value = value()
+            value = str(value or "").strip()
+            if value:
+                return value
+        except Exception:
+            pass
+        try:
+            return str(tab.run_js("return location.href;") or "").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _url_login_state(url: str) -> str | None:
+        """把 URL 归类为 login、home 或 unknown；homepage 后可带任意查询参数。"""
+        url = str(url or "").strip()
+        if not url:
+            return None
+        try:
+            parsed = urlsplit(url)
+            host = parsed.netloc.lower()
+            path = parsed.path.rstrip("/").lower()
+            login_reference = urlsplit(TIKTOK_LOGIN_URL)
+            home_reference = urlsplit(TIKTOK_HOME_URL_PREFIX)
+            if host == login_reference.netloc.lower() and path == login_reference.path.rstrip("/").lower():
+                return "login"
+            if host == home_reference.netloc.lower() and path == home_reference.path.rstrip("/").lower():
+                return "home"
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _url_matches_target(current_url: str, target_url: str) -> bool:
+        """比较目标页面的 host 和 path；忽略 query/hash，允许页面自动附加参数。"""
+        try:
+            current = urlsplit(str(current_url or "").strip())
+            target = urlsplit(str(target_url or "").strip())
+            return (
+                bool(current.netloc)
+                and current.netloc.lower() == target.netloc.lower()
+                and current.path.rstrip("/").lower() == target.path.rstrip("/").lower()
+            )
+        except Exception:
+            return False
+
+    def _wait_for_target_url(self, tab: Any, target_url: str, timeout_seconds: float, page_name: str) -> bool:
+        """等待 tab.get() 真正进入目标路由，防止首页通用控件造成页面就绪误判。"""
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            current_url = self._current_url(tab)
+            if self._url_matches_target(current_url, target_url):
+                LOGGER.info("[TikTok][目标URL确认] 页面=%s，当前url=%s", page_name, current_url)
+                return True
+            LOGGER.info("[TikTok][目标URL等待] 页面=%s，当前url=%s，目标=%s", page_name, current_url or "<空>", target_url)
+            self._human_wait(tab, 1, check_interruptions=False)
+        LOGGER.error(
+            "[TikTok][目标URL超时] 页面=%s，%.1f 秒内未进入目标路由，最后url=%s，目标=%s",
+            page_name,
+            timeout_seconds,
+            self._current_url(tab) or "<空>",
+            target_url,
+        )
+        return False
+
+    def _check_login_url(self, tab: Any) -> str | None:
+        """按用户要求检查登录页 URL；首页一旦出现就立即确认已登录。"""
+        first_url = self._current_url(tab)
+        first_state = self._url_login_state(first_url)
+        LOGGER.info(
+            "[TikTok][URL登录初检] url=%s，状态=%s",
+            first_url or "<空>",
+            first_state or "unknown",
+        )
+        if first_state == "home":
+            return "home"
+        if first_state != "login":
+            return None
+
+        # 初始 URL 已经是登录页，因此每一次复查前都先等待 5 秒，
+        # 四次检查分别约发生在第 5、10、15、20 秒，符合“连续 4 次、总计 20 秒”的要求。
+        saw_unknown_url = False
+        for check_index in range(1, LOGIN_URL_CHECK_TIMES + 1):
+            LOGGER.info(
+                "[TikTok][URL登录复查等待] 第 %s/%s 次检查前等待 %.1f 秒",
+                check_index,
+                LOGIN_URL_CHECK_TIMES,
+                LOGIN_URL_CHECK_INTERVAL_SECONDS,
+            )
+            self._human_wait(tab, LOGIN_URL_CHECK_INTERVAL_SECONDS, check_interruptions=False)
+
+            current_url = self._current_url(tab)
+            current_state = self._url_login_state(current_url)
+            LOGGER.info(
+                "[TikTok][URL登录复查] 第 %s/%s 次，url=%s，状态=%s",
+                check_index,
+                LOGIN_URL_CHECK_TIMES,
+                current_url or "<空>",
+                current_state or "unknown",
+            )
+            if current_state == "home":
+                LOGGER.info("[TikTok][URL登录确认] 检查过程中发现 homepage，立即确认已登录")
+                return "home"
+            if current_state != "login":
+                saw_unknown_url = True
+                LOGGER.warning("[TikTok][URL登录状态不明确] 当前 URL 不是 login 或 homepage，本次不确认已登录")
+
+        LOGGER.warning(
+            "[TikTok][URL未登录确认] %s，连续检查=%s次，累计观察约 %.1f 秒，按未登录或登录未完成处理",
+            "URL 连续保持登录页" if not saw_unknown_url else "观察期间未确认 homepage",
+            LOGIN_URL_CHECK_TIMES,
+            LOGIN_URL_CHECK_TIMES * LOGIN_URL_CHECK_INTERVAL_SECONDS,
+        )
+        return "login"
+
+    def _wait_for_homepage_url(self, tab: Any, timeout_seconds: float) -> bool:
+        """登录提交后等待 URL 进入 homepage，防止仅凭弹窗或按钮提前结束登录流程。"""
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            current_url = self._current_url(tab)
+            current_state = self._url_login_state(current_url)
+            LOGGER.info("[TikTok][登录成功URL等待] url=%s，状态=%s", current_url or "<空>", current_state or "unknown")
+            if current_state == "home":
+                self._last_url_login_state = "home"
+                return True
+            self._human_wait(tab, 1, check_interruptions=False)
+        LOGGER.error(
+            "[TikTok][登录成功URL超时] %.1f 秒内未进入 homepage，最后url=%s",
+            timeout_seconds,
+            self._current_url(tab) or "<空>",
+        )
+        return False
+
     def _is_login_required(self, tab: Any) -> bool:
-        """先检查登录入口和已登录标志；登录入口出现后等待5秒，再复查一次。"""
+        """优先按 URL 判定登录；URL 不明确时才回退到登录入口和页面元素。"""
+        url_state = self._check_login_url(tab)
+        if url_state in {"login", "home"}:
+            self._last_url_login_state = url_state
+            LOGGER.info(
+                "[TikTok][URL登录结论] 状态=%s，%s",
+                url_state,
+                "需要登录" if url_state == "login" else "确认已登录",
+            )
+            return url_state == "login"
+
+        LOGGER.warning("[TikTok][URL登录结论] URL 无法归类，回退检查页面登录入口和业务标志")
         login_entry = self._find_visible_element(tab, LOGIN_EMAIL_PANEL_BUTTON_XPATH, timeout=0.5)
         authenticated_marker = self._main_navigation_name(tab)
         LOGGER.info(
@@ -756,7 +926,15 @@ class TiktokAuto:
         LOGGER.info("[TikTok][登录成功] 已发现登录确认标志，立即进入已登录后的固定页面流程")
 
     def _login_step_already_authenticated(self, tab: Any, step_name: str) -> bool:
-        """登录过程每一步调用；发现四类已登录标志之一时立刻切换到已登录流程。"""
+        """登录过程每一步调用；URL 仍为登录页时，不能被弹窗或按钮提前放行。"""
+        route_state = self._url_login_state(self._current_url(tab))
+        if route_state == "home":
+            LOGGER.info("[TikTok][登录步骤URL确认] 步骤=%s，当前 URL 已进入 homepage", step_name)
+            return True
+        if route_state == "login":
+            LOGGER.info("[TikTok][登录步骤URL确认] 步骤=%s，当前仍在登录页，不判定登录成功", step_name)
+            return False
+
         marker_name = self._main_navigation_name(tab)
         LOGGER.info(
             "[TikTok][登录步骤复查] 步骤=%s，已登录标志=%s",
@@ -804,9 +982,9 @@ class TiktokAuto:
         deadline = started_at + timeout_seconds
         LOGGER.info("[TikTok][登录结果等待] 最长 %.1f 秒等待业务菜单、手机号格式错误或图形验证码", timeout_seconds)
         while time.monotonic() < deadline:
-            navigation_name = self._main_navigation_name(tab)
-            if navigation_name:
-                LOGGER.info("[TikTok][登录结果] 已发现%s，直接登录成功", navigation_name)
+            route_state = self._url_login_state(self._current_url(tab))
+            if route_state == "home":
+                LOGGER.info("[TikTok][登录结果] URL 已进入 homepage，确认登录成功")
                 return "authenticated"
             if self._element_state_matches(tab, LOGIN_PHONE_FORMAT_ERROR_XPATH, "visible"):
                 LOGGER.warning("[TikTok][登录结果] 已出现“请检查输入的手机号格式”")
@@ -814,6 +992,12 @@ class TiktokAuto:
             if self._element_state_matches(tab, CAPTCHA_IMAGE_XPATH, "visible"):
                 LOGGER.warning("[TikTok][登录结果] 已发现物体匹配验证码")
                 return "captcha"
+            # 登录 URL 仍存在时，营销按钮或弹窗只能说明页面有内容，不能直接算登录成功。
+            if route_state != "login":
+                navigation_name = self._main_navigation_name(tab)
+                if navigation_name:
+                    LOGGER.info("[TikTok][登录结果] URL 未处于登录页且已发现%s，暂记为登录候选", navigation_name)
+                    return "authenticated"
             self._human_wait(tab, 0.5, check_interruptions=False)
         LOGGER.info("[TikTok][登录结果等待] %.1f 秒内没有明确结果，继续等待业务菜单", time.monotonic() - started_at)
         return "pending"
@@ -1196,10 +1380,15 @@ class TiktokAuto:
         """验证码提交后等待业务菜单；图片更新表示识别失败，需要重新处理新验证码。"""
         deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
-            navigation_name = self._main_navigation_name(tab)
-            if navigation_name:
-                LOGGER.info("[TikTok][验证码结果] 已发现%s，验证码通过", navigation_name)
+            route_state = self._url_login_state(self._current_url(tab))
+            if route_state == "home":
+                LOGGER.info("[TikTok][验证码结果] URL 已进入 homepage，验证码流程通过")
                 return True
+            if route_state != "login":
+                navigation_name = self._main_navigation_name(tab)
+                if navigation_name:
+                    LOGGER.info("[TikTok][验证码结果] 已发现%s，验证码通过候选", navigation_name)
+                    return True
 
             captcha_img = self._find_visible_element(tab, CAPTCHA_IMAGE_XPATH, timeout=0.5)
             if captcha_img:
@@ -1230,6 +1419,19 @@ class TiktokAuto:
             timeout_seconds,
         )
         while time.monotonic() < deadline:
+            route_state = self._url_login_state(self._current_url(tab))
+            if route_state == "home":
+                LOGGER.info("[TikTok][业务入口出现] URL 已进入 homepage，确认登录成功")
+                self._last_url_login_state = "home"
+                return True
+            # 登录页仍在时，只处理验证码，不接受营销按钮/弹窗作为登录完成信号。
+            if route_state == "login":
+                if handle_login_captcha and self._element_state_matches(tab, CAPTCHA_IMAGE_XPATH, "visible"):
+                    LOGGER.warning("[TikTok][业务入口等待] 登录页发现验证码，进入验证码处理")
+                    self._solve_login_captcha(tab)
+                self._human_wait(tab, 0.5, check_interruptions=False)
+                continue
+
             navigation_name = self._main_navigation_name(tab)
             if navigation_name:
                 LOGGER.info(
@@ -1254,12 +1456,16 @@ class TiktokAuto:
             LOGGER.info("[TikTok][页面跳转] 页面=%s，开始打开 URL=%s", page_name, url)
             tab.get(url)
             LOGGER.info(
-                "[TikTok][页面跳转完成] 页面=%s，已调用 tab.get，等待时间面板按钮出现，xpath=%s",
+                "[TikTok][页面跳转完成] 页面=%s，已调用 tab.get，先等待目标 URL，再等待时间面板按钮，xpath=%s",
                 page_name,
                 ready_xpath,
             )
         except Exception as exc:
             LOGGER.exception("[TikTok][页面跳转失败] 页面=%s，URL=%s，异常=%s", page_name, url, exc)
+            return False
+
+        if not self._wait_for_target_url(tab, url, PAGE_READY_TIMEOUT_SECONDS, page_name):
+            LOGGER.error("[TikTok][页面跳转失败] 页面=%s，当前页面没有进入目标 URL，不读取首页控件", page_name)
             return False
 
         ready = self._wait_for_xpath(
