@@ -121,6 +121,17 @@ SHOPEE_TABLE_FIELD_ORDER: tuple[str, ...] = (
     "昨天ALL点击率",
 )
 
+# Shopee 只有点击率和加购率属于百分比；广告支出回报率是普通倍数，不能追加百分号。
+# SP_auto.py 内部用 0.033 表示 3.3%，写入飞书多维表和电子表时再转换成 "3.3%" 文本。
+SHOPEE_PERCENT_TEXT_FIELDS: frozenset[str] = frozenset(
+    {
+        "昨天ALL点击率",
+        "7天ALL点击率",
+        "昨天ALL加购率",
+        "7天ALL加购率",
+    }
+)
+
 
 # 美客多多维表和历史电子表的固定 32 字段顺序。
 # 多维表只接收这些已建立字段，避免通用“指标/数值/原始数据”导致 WrongRequestBody。
@@ -159,7 +170,8 @@ MERCADO_TABLE_FIELD_ORDER: tuple[str, ...] = (
     "30天总转换率",
 )
 
-# 机器人消息需要把内部数值比例重新显示成人能直接阅读的百分比。
+# 美客多爬虫内部用 0.333 表示 33.3%，写入飞书多维表、电子表和机器人消息时再转成百分比文本。
+# 飞书端这些字段当前均为文本类型，所以传输值必须是 "33.3%" 字符串，不能直接发送 0.333 浮点数。
 MERCADO_PROGRESS_FIELDS: frozenset[str] = frozenset(
     {
         "7天转换率",
@@ -807,7 +819,8 @@ class DailyStoreCheck:
         if not collected_at:
             collected_at = datetime.now(timezone.utc).isoformat()
 
-        # 飞书金额和小数字段不能接收空字符串，因此只把非空业务指标加入请求 JSON。
+        # 飞书金额和数字字段不能接收空字符串，因此只把非空业务指标加入请求 JSON。
+        # 点击率和加购率在飞书端是文本字段，发送前统一转换成 "3.3%" 字符串。
         bitable_record: dict[str, Any] = {
             "店铺名": task.store_name,
             "采集时间": self._to_feishu_timestamp_ms(collected_at),
@@ -817,6 +830,8 @@ class DailyStoreCheck:
                 continue
             value = merged_fields.get(field_name, "")
             if value not in ("", None):
+                if field_name in SHOPEE_PERCENT_TEXT_FIELDS:
+                    value = self._format_percent_text(value, platform_log_name="SP")
                 bitable_record[field_name] = value
 
         missing_fields = [
@@ -832,6 +847,10 @@ class DailyStoreCheck:
         spreadsheet_values = dict(merged_fields)
         spreadsheet_values["店铺名"] = task.store_name
         spreadsheet_values["采集时间"] = collected_at
+        for field_name in SHOPEE_PERCENT_TEXT_FIELDS:
+            value = spreadsheet_values.get(field_name, "")
+            if value not in ("", None):
+                spreadsheet_values[field_name] = self._format_percent_text(value, platform_log_name="SP")
         spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in SHOPEE_TABLE_FIELD_ORDER]
         return [bitable_record], [spreadsheet_row]
 
@@ -862,7 +881,8 @@ class DailyStoreCheck:
         if unknown_fields:
             LOGGER.warning("[飞书][MKD未知字段] 以下字段不在 32 字段定义中，不写入多维表：%s", unknown_fields)
 
-        # 数字、货币和进度字段都不能发送空字符串；空指标直接从 JSON 中省略。
+        # 数字和货币字段不能发送空字符串；空指标直接从 JSON 中省略。
+        # 转换率字段在飞书端已经改成文本类型，因此发送前统一转换成 "33.3%" 字符串。
         bitable_record: dict[str, Any] = {
             "店铺名": task.store_name,
             "采集时间": self._to_feishu_timestamp_ms(collected_at),
@@ -872,6 +892,8 @@ class DailyStoreCheck:
                 continue
             value = merged_fields.get(field_name, "")
             if value not in ("", None):
+                if field_name in MERCADO_PROGRESS_FIELDS:
+                    value = self._format_percent_text(value, platform_log_name="MKD")
                 bitable_record[field_name] = value
 
         missing_fields = [
@@ -887,8 +909,29 @@ class DailyStoreCheck:
         spreadsheet_values = dict(merged_fields)
         spreadsheet_values["店铺名"] = task.store_name
         spreadsheet_values["采集时间"] = collected_at
+        for field_name in MERCADO_PROGRESS_FIELDS:
+            value = spreadsheet_values.get(field_name, "")
+            if value not in ("", None):
+                spreadsheet_values[field_name] = self._format_percent_text(value, platform_log_name="MKD")
         spreadsheet_row = [spreadsheet_values.get(field_name, "") for field_name in MERCADO_TABLE_FIELD_ORDER]
         return [bitable_record], [spreadsheet_row]
+
+    @staticmethod
+    def _format_percent_text(value: Any, platform_log_name: str = "") -> str:
+        """把平台内部的数值比例转换为飞书文本字段使用的百分比字符串。"""
+        text = str(value).strip()
+        already_percent = text.endswith("%")
+        number_text = text[:-1].strip() if already_percent else text
+
+        try:
+            number = float(number_text.replace(",", "."))
+        except (TypeError, ValueError):
+            LOGGER.warning("[飞书][%s百分比转换失败] 原始值=%r，保留原文本", platform_log_name or "平台", value)
+            return text
+
+        # 正常爬虫结果是 0~1 的比例；也兼容 "33,3%" 或人工传入 33.3 这种百分数。
+        percent_number = number if already_percent or abs(number) > 1 else number * 100
+        return f"{percent_number:.1f}%"
 
     @staticmethod
     def _to_feishu_timestamp_ms(value: Any) -> int:

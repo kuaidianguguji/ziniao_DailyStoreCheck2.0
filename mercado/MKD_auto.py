@@ -591,8 +591,8 @@ class MercadoAuto:
         if kind == "currency":
             return round(number, 2)
         if kind == "percent":
-            # 飞书“进度/百分比”字段必须接收数值比例，不能发送 "15%" 文本。
-            # 页面 12.5% 转为 0.125，飞书按字段配置显示为 12.5%。
+            # 爬虫内部统一保存数值比例，便于后续计算和 DeepSeek 分析。
+            # 页面 12.5% 转为 0.125；写入飞书时由 orchestrator 转换成 "12.5%" 文本。
             ratio = number / 100 if "%" in str(raw_text) or abs(number) > 1 else number
             return round(ratio, 4)
         return raw_text

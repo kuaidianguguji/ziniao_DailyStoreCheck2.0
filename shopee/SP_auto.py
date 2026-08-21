@@ -176,7 +176,7 @@ PERIOD_CLICK_STEPS: dict[str, list[dict[str, Any]]] = {
 # ---------------------------------------------------------------------------
 
 # kind 可选值：
-# integer=整数；percent=页面百分数去掉百分号后的两位小数；
+# integer=整数；percent=页面百分数转换成 0~1 的数值比例；
 # currency=巴西雷亚尔两位小数；decimal=普通两位小数。
 # 同一指标在昨天和 7 天页面通常使用相同 XPath，但仍分别保留，方便页面差异化维护。
 # 用户补充 XPath 时，金额使用 kind=currency，数量使用 kind=integer，百分比使用 kind=percent。
@@ -299,7 +299,7 @@ class ShopeeAuto:
                 converted_value = self._format_value(raw_text, value_kind)
                 display_value = self._format_display_value(converted_value, value_kind)
                 LOGGER.info(
-                    "[Shopee][指标结果] 字段=%s，原始值=%r，原始类型=%s，飞书数值=%r，数值类型=%s，显示值=%r，配置类型=%s，币种=%s",
+                    "[Shopee][指标结果] 字段=%s，原始值=%r，原始类型=%s，内部数值=%r，数值类型=%s，显示值=%r，配置类型=%s，币种=%s",
                     field_name,
                     raw_text,
                     type(raw_text).__name__,
@@ -325,7 +325,8 @@ class ShopeeAuto:
                     "平台": "shopee",
                     "采集时间": collected_at,
                     "指标": field_name,
-                    # 数值用于多维表和历史电子表，必须保持 int/float，不能带 R$ 或 %。
+                    # 数值保留为 int/float，百分比用 0~1 的比例保存，便于计算和 DeepSeek 分析。
+                    # 编排器写入飞书时，才会把 0.0379 转换成 "3.8%" 文本。
                     "数值": converted_value,
                     # 显示值用于机器人和 ALL_info，保留人能直接识别的货币/百分比单位。
                     "显示值": display_value,
@@ -1153,7 +1154,7 @@ class ShopeeAuto:
 
     @staticmethod
     def _format_value(raw_text: str, kind: str) -> Any:
-        """转换 Shopee 数值：BRL、普通小数和百分数均保留两位，数量转为整数。"""
+        """转换 Shopee 数值：金额/小数保留两位，百分比转为 0~1 比例，数量转为整数。"""
         if not raw_text:
             return ""
         if kind == "integer":
@@ -1167,14 +1168,14 @@ class ShopeeAuto:
         if kind == "decimal":
             return round(number, 2)
         if kind == "percent":
-            # Shopee 飞书表中的点击率和加购率是“小数”字段，不是“进度/百分比”字段。
-            # 页面 7,61% 因此写入数值 7.61，不能发送字符串 "7.61%"。
-            return round(number, 2)
+            # 页面 3,79% 转为内部比例 0.0379；发送飞书时再转换成 "3.8%" 字符串。
+            ratio = number / 100 if "%" in str(raw_text) or abs(number) > 1 else number
+            return round(ratio, 4)
         return raw_text
 
     @staticmethod
     def _format_display_value(value: Any, kind: str) -> str:
-        """为机器人消息格式化单位；飞书写入仍使用独立的纯数字 value。"""
+        """为机器人消息格式化单位；百分比内部比例在此转换成人可读文本。"""
         if value in ("", None):
             return ""
         try:
@@ -1182,8 +1183,8 @@ class ShopeeAuto:
                 # 巴西原始格式 R$17.490,26 规范显示为 R$17490.26。
                 return f"R${float(value):.2f}"
             if kind == "percent":
-                # 巴西原始格式 3,79% 规范显示为 3.79%。
-                return f"{float(value):.2f}%"
+                # 内部比例 0.0379 规范显示为 3.8%，与飞书文本字段保持一致。
+                return f"{float(value) * 100:.1f}%"
             if kind == "decimal":
                 return f"{float(value):.2f}"
             if kind == "integer":
