@@ -48,7 +48,7 @@ TIKTOK_HOME_URL_PREFIX = "https://seller-br.tiktok.com/homepage"
 CAPTCHA_IMAGE_XPATH = '//img[@alt="captchaOpti_hCaptchaModal1_header"]'
 CAPTCHA_CONFIRM_BUTTON_XPATH = '//button[normalize-space(.)="确认"]'
 # 单次识别或提交失败后的额外重试次数；值为 2 表示最多处理 3 张验证码图片。
-CAPTCHA_SOLVE_RETRY_TIMES = 2
+CAPTCHA_SOLVE_RETRY_TIMES = 3
 # 同一张验证码图片连续请求视觉模型的次数。五次坐标分别求平均后再点击，降低单次识别的位置误差。
 CAPTCHA_RECOGNITION_SAMPLE_COUNT = 5
 # 点击验证码确认按钮后，等待业务菜单、验证码消失或验证码图片更新的最长秒数。
@@ -76,7 +76,7 @@ LOGIN_URL_CHECK_INTERVAL_SECONDS = 1
 LOGIN_SUCCESS_URL_TIMEOUT_SECONDS = 60
 # 每次点击时间按钮或日期按钮后，最多等待多少秒确认状态；超时才进入重试。
 # 用户要求所有按钮点击后的状态等待统一使用这个变量。
-TK_STEP_WAIT_SECONDS = 8
+TK_STEP_WAIT_SECONDS = 2
 # 调用 tab.get() 跳转广告页或概览页后，等待 URL 进入目标路径的最长时间。
 BUSINESS_PAGE_URL_TIMEOUT_SECONDS = 120
 # 已进入广告页或概览页目标路径后，等待该页面时间按钮出现的最长时间。
@@ -84,11 +84,11 @@ BUSINESS_PAGE_ELEMENT_TIMEOUT_SECONDS = 120
 # 页面日期切换后，等待 document.readyState=complete 的最长时间。
 DATA_PAGE_READY_TIMEOUT_SECONDS = 120
 # 单个按钮首次点击失败后的额外重试次数；值为 3 时最多执行 1 次首次点击加 3 次重试。
-CLICK_RETRY_TIMES = 4
+CLICK_RETRY_TIMES = 20
 # 同一按钮相邻两次重试之间的基础等待秒数；实际还会随机增加 0 至 1 秒。
 CLICK_RETRY_INTERVAL_SECONDS = 2
 # 数据加载完成标志首次未出现后允许的重查次数；值为 5 表示最多额外检查 5 次。
-DATA_READY_RETRY_TIMES = 5
+DATA_READY_RETRY_TIMES = 20
 # 数据加载完成标志相邻两次检查的等待秒数；5 次重查最长等待约 10 秒。
 DATA_READY_RETRY_INTERVAL_SECONDS = 2
 
